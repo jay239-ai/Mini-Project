@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101a24">
+  <meta name="description" content="Analyze traffic camera views and review explainable junction advisories with site-specific history.">
+  <title>Traffic Analysis | Free-Left Monitor</title>
+  <link rel="stylesheet" href="css/style.css?v=live-decision-2">
+  <script src="js/app.js?v=live-decision-2" defer></script>
+</head>
+<body class="dashboard">
+  <aside class="sidebar" aria-label="Main navigation">
+    <a class="brand" href="#overview"><span class="brand-mark" aria-hidden="true">↰</span><span><strong>Free-Left Monitor</strong><small>TRAFFIC ANALYSIS</small></span></a>
+    <div class="nav-label">WORKSPACE</div>
+    <a class="nav-item active" href="#overview"><span>◫</span> Overview</a>
+    <a class="nav-item" href="#monitoring"><span>◉</span> Camera analysis</a>
+    <a class="nav-item" href="#history"><span>▤</span> Site history</a>
+    <div class="sidebar-spacer"></div>
+    <div class="intersection-card"><span class="live-dot"></span><div><small>SELECTED SITE</small><strong id="sidebarSite">Junction A · North</strong></div></div>
+  </aside>
+
+  <main class="main-content">
+    <header class="topbar"><div class="breadcrumbs">Workspace <span>/</span> <strong id="breadcrumbCurrent">Overview</strong></div><div class="topbar-right"><span class="demo-badge" id="apiStatus" role="status" aria-live="polite"><i></i> API CHECKING</span></div></header>
+    <section class="page-heading" id="overview" data-section-name="Overview">
+      <div><p class="eyebrow">JUNCTION ADVISORY</p><h1>Traffic analysis</h1><p class="subheading">Analyze current camera evidence, add a historic report for the same site, and review why the advisory was made.</p></div>
+    </section>
+
+    <section class="content-grid" id="monitoring" data-section-name="Camera analysis">
+      <article class="panel video-panel">
+        <div class="panel-heading"><div><p class="eyebrow">THREE CAMERA ANALYSIS</p><h2>Live detection view</h2></div><span class="source-status"><i></i><span id="sourceStatus">WAITING FOR INPUT</span></span></div>
+        <div class="source-mode-row"><label for="sourceMode">Analysis mode</label><select id="sourceMode"><option value="recorded">Upload videos</option><option value="live_usb">Live cameras</option></select></div>
+        <label class="site-label" for="siteLabelInput">Intersection / site name<input id="siteLabelInput" type="text" value="Junction A · North" maxlength="120" autocomplete="off"><small>Used to match local traffic history to this camera analysis.</small></label>
+        <div class="tracking-grid" aria-label="Three analyzed camera views">
+          <article class="tracking-camera-card" id="cameraRowApproach">
+            <div class="tracking-card-heading"><strong>Camera 01 · Main approach / free-left</strong><span id="approachCameraStatus">Waiting</span></div>
+            <div class="tracking-image-wrap"><video id="videoPreview" class="tracking-video" controls playsinline hidden aria-label="Approach camera upload preview"></video><img id="trackingFrame" class="tracking-frame" alt="Approach view with vehicle tracking boxes" hidden><span class="tracking-empty">Choose a clip or connect a live camera</span></div>
+            <div class="tracking-observations" id="approachObservations">Vehicle and pedestrian counts appear while frames are analyzed.</div>
+          </article>
+          <article class="tracking-camera-card" id="cameraRowTurning">
+            <div class="tracking-card-heading"><strong>Camera 02 · Free-left turn / pedestrian</strong><span id="turningCameraStatus">Waiting</span></div>
+            <div class="tracking-image-wrap"><video id="pedestrianPreview" class="tracking-video" controls playsinline hidden aria-label="Turning camera upload preview"></video><img id="turningTrackingFrame" class="tracking-frame" alt="Turning view with vehicle tracking boxes" hidden><span class="tracking-empty">Choose a clip or connect a live camera</span></div>
+            <div class="tracking-observations" id="turningObservations">Vehicle and pedestrian counts appear while frames are analyzed.</div>
+          </article>
+          <article class="tracking-camera-card" id="cameraRowExit">
+            <div class="tracking-card-heading"><strong>Camera 03 · Joining road (right-side view)</strong><span id="exitCameraStatus">Waiting</span></div>
+            <div class="tracking-image-wrap"><video id="oppositePreview" class="tracking-video" controls playsinline hidden aria-label="Joining road camera upload preview"></video><img id="exitTrackingFrame" class="tracking-frame" alt="Joining road view with vehicle tracking boxes" hidden><span class="tracking-empty">Choose a clip or connect a live camera</span></div>
+            <div class="tracking-observations" id="exitObservations">Vehicle and pedestrian counts appear while frames are analyzed.</div>
+            <div class="joining-flow-status" id="joiningFlowStatus" role="status" aria-live="polite">Joining-road movement: waiting for camera data.</div>
+          </article>
+        </div>
+        <div id="recordedSourceControls" class="recorded-inputs">
+          <div class="camera-input-card"><strong>Camera 01 · Main approach / free-left</strong><small id="videoFileName">No clip selected</small><label for="videoUpload" class="button button-small button-secondary upload-label">Choose clip</label><input id="videoUpload" type="file" accept="video/mp4,video/quicktime,video/x-msvideo,video/webm,.mkv" hidden></div>
+          <div class="camera-input-card"><strong>Camera 02 · Free-left turn / pedestrian</strong><small id="pedestrianFileName">No clip selected</small><label for="pedestrianUpload" class="button button-small button-secondary upload-label">Choose clip</label><input id="pedestrianUpload" type="file" accept="video/mp4,video/quicktime,video/x-msvideo,video/webm,.mkv" hidden></div>
+          <div class="camera-input-card"><strong>Camera 03 · Joining road (right-side view)</strong><small id="oppositeFileName">No clip selected</small><label for="oppositeUpload" class="button button-small button-secondary upload-label">Choose clip</label><input id="oppositeUpload" type="file" accept="video/mp4,video/quicktime,video/x-msvideo,video/webm,.mkv" hidden></div>
+        </div>
+        <div id="liveSourceControls" class="live-source-controls" hidden>
+          <div class="live-source-heading"><strong>Wired USB cameras</strong><button class="button button-small button-secondary" id="refreshUsbCameras" type="button">Find cameras</button></div>
+          <p>Connect one wired camera per view, then assign each device below.</p>
+          <label>Camera 01 · Main approach / free-left <select id="liveDeviceApproach"><option value="">Not connected</option></select></label>
+          <label>Camera 02 · Free-left turn / pedestrian <select id="liveDeviceTurning"><option value="">Not connected</option></select></label>
+          <label>Camera 03 · Joining road (right-side view) <select id="liveDeviceExit"><option value="">Not connected</option></select></label>
+          <small id="liveDeviceStatus" role="status">The full advisory needs all three camera views.</small>
+          <button class="button button-primary" id="startLiveBtn" type="button">Start live analysis</button>
+        </div>
+        <div class="analysis-actions"><label for="performanceProfile">Processing mode <select id="performanceProfile"><option value="fast" selected>Fast · target 30 FPS</option><option value="balanced">Balanced · higher detail</option></select></label><button class="button button-primary" id="analyzeBtn" type="button" disabled>Analyze three clips (0/3)</button><button class="button button-secondary" id="stopAnalysisBtn" type="button" hidden>Stop analysis</button><span id="analysisStatus" role="status" aria-live="polite">0 of 3 camera clips selected. Choose one clip for each camera; analysis starts when you click the button.</span></div>
+        <div class="analysis-progress" id="analysisProgress" hidden><div class="scan-track"><i></i></div><strong id="progressLabel">Preparing analysis…</strong><span id="progressPercent">0%</span></div>
+      </article>
+
+      <article class="panel decision-panel">
+        <div class="panel-heading"><div><p class="eyebrow">TRAFFIC CONDITION · ADVISORY ONLY</p><h2>Junction status</h2></div><a class="button button-small button-secondary" id="downloadReportLink" href="#" hidden>Download analysis report</a></div>
+        <div class="traffic-advisory">
+          <div class="traffic-lamp" id="trafficLamp" data-state="unknown" role="img" aria-label="Traffic condition waiting for camera data"><i class="lamp-red"></i><i class="lamp-yellow"></i><i class="lamp-green"></i></div>
+          <div><strong id="trafficStateLabel">WAITING FOR DATA</strong><p id="decisionReason">Start an analysis to see whether current traffic conditions are green, yellow or red.</p><small id="decisionEvidence">This is a traffic-condition advisory, not a command to real signal hardware.</small></div>
+        </div>
+      </article>
+    </section>
+
+    <section class="panel history-panel history-section" id="history" data-section-name="Site history">
+      <div class="panel-heading"><div><p class="eyebrow">HISTORICAL CONTEXT</p><h2>Previous congestion reports</h2></div><span class="risk-pill low" id="historyRisk">NO REPORTS</span></div>
+      <div class="history-summary"><strong id="reportName">No report uploaded</strong><p id="reportSummary">Import a text-based traffic report PDF to add historical context for this site.</p></div>
+      <div class="history-facts"><div><span>Reports</span><strong id="reportCount">0</strong></div><div><span>Jams · latest PDF</span><strong id="incidentCount">—</strong></div><div><span>Violations · latest</span><strong id="violationCount">—</strong></div><div><span>Peak congestion</span><strong id="peakCongestion">—</strong></div><div><span>Largest queue</span><strong id="historicalMaxQueue">—</strong></div><div><span>Queue length</span><strong id="historicalMaxQueueLength">—</strong></div><div><span>Average delay · latest</span><strong id="averageHistoricalDelay">—</strong></div><div><span>Longest delay · latest</span><strong id="longestHistoricalDelay">—</strong></div></div>
+      <div id="historyReportRows" class="history-report-rows" aria-label="Imported historical reports"></div>
+      <label for="reportUpload" class="button button-secondary report-upload">Import traffic report PDF</label><input id="reportUpload" type="file" accept="application/pdf,.pdf" hidden>
+      <p id="historyStatus" class="panel-note" role="status" aria-live="polite">PDFs are processed locally. Extracted summary numbers are stored in the local SQLite database; the PDF and full text are discarded.</p>
+      <ul id="historyWarnings" class="history-warnings" hidden></ul>
+    </section>
+
+    <footer class="footer"><span>Site-specific history · locally stored</span><span>Advisory only · no signal control</span></footer>
+  </main>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

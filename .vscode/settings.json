@@ -1,0 +1,12 @@
+{
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.pytest_cache": true,
+    ".runtime": true,
+    "data/processed": true,
+    "backend/app/database": true,
+    "backend/tests": true,
+    "docs": true,
+    "scripts": true
+  }
+}

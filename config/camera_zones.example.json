@@ -1,0 +1,39 @@
+{
+  "units": "source_frame_pixels",
+  "site_label": "Junction A · North",
+  "reference_resolution": [1280, 720],
+  "note": "Example polygons are scaled to each clip size. Calibrate the approach and free-left zones in cameras 1–2, draw pedestrian_nearby as the near-crossing vehicle buffer around pedestrian_conflict in camera 2, and draw the exit-kind joining_road_flow zone over only the right-side road that merges into the free-left route in camera 3. Calibration is required before relying on zone-based measurements.",
+  "camera_clock_offsets_seconds": {"approach": 0, "turning": 0, "exit": 0},
+  "cameras": {
+    "approach": [
+      {"name": "queue_area", "kind": "approach", "polygon": [[80, 390], [640, 350], [850, 700], [60, 700]]},
+      {"name": "free_left_lane", "kind": "free_left", "polygon": [[850, 405], [1215, 420], [1260, 680], [820, 680]]}
+    ],
+    "turning": [
+      {"name": "free_left_lane", "kind": "free_left", "polygon": [[850, 405], [1215, 420], [1260, 680], [820, 680]]},
+      {"name": "crossing_conflict", "kind": "pedestrian_conflict", "polygon": [[880, 380], [1190, 350], [1270, 600], [930, 630]]},
+      {"name": "vehicle_near_crossing_buffer", "kind": "pedestrian_nearby", "polygon": [[760, 340], [1210, 320], [1270, 640], [800, 690]]}
+    ],
+    "exit": [
+      {"name": "joining_road_flow", "kind": "exit", "polygon": [[30, 260], [900, 280], [1210, 690], [20, 690]]},
+      {"name": "exit_crossing", "kind": "pedestrian_conflict", "polygon": [[850, 400], [1180, 400], [1260, 690], [920, 690]]}
+    ]
+  },
+  "thresholds": {
+    "stationary_speed_px_per_second": 8,
+    "waiting_seconds": 10,
+    "blockage_start_seconds": 5,
+    "blockage_medium_seconds": 10,
+    "blockage_high_seconds": 30,
+    "queue_medium_vehicles": 5,
+    "queue_high_vehicles": 10,
+    "stopped_delay_medium_vehicle_seconds": 30,
+    "stopped_delay_high_vehicle_seconds": 60,
+    "risk_score_medium": 35,
+    "risk_score_high": 65,
+    "joining_flow_stationary_ratio_medium": 0.65,
+    "minimum_observation_seconds": 2,
+    "minimum_confidence_frames_per_camera": 30,
+    "pedestrian_clearance_hold_seconds": 2
+  }
+}
