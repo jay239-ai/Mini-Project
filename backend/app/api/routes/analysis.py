@@ -461,8 +461,9 @@ def _analyze_camera(
             with update_lock:
                 job["preview_jpegs"][camera_id] = preview_buffer.tobytes()
                 job["frame_sequences"][camera_id] += 1
-    if TARGET_FPS < source_fps < 1000:
-        frame_stride = max(frame_stride, round(source_fps / TARGET_FPS))
+    if 0 < source_fps < 1000:
+        target_sample_fps = TARGET_FPS if device != "cpu" else (10 if frame_stride >= 3 else 15)
+        frame_stride = max(frame_stride, round(source_fps / target_sample_fps))
     scale_x, scale_y = frame_width / reference_width, frame_height / reference_height
     scaled_zone_data = [
         {**zone, "polygon": [[round(point[0] * scale_x), round(point[1] * scale_y)] for point in zone["polygon"]]}
@@ -633,9 +634,18 @@ def _run_job(job_id: str, input_dir: Path, paths: list[Path], performance_profil
         if device != "cpu":
             torch.backends.cudnn.benchmark = True
         if performance_profile == "fast":
-            frame_stride = 1
-            image_sizes = {camera: (512 if camera == "turning" else 416) if device == "0" else 416 for camera in CAMERAS}
+            # CPU inference is the bottleneck on the reported run. Sample at
+            # about 10 FPS and use a smaller inference size in fast mode; this still
+            # gives multiple observations for ordinary moving objects.
+            frame_stride = 1 if device == "0" else 3
+            image_sizes = {
+                camera: (512 if camera == "turning" else 416) if device == "0" else 320
+                for camera in CAMERAS
+            }
         else:
+            # Per-camera FPS metadata below keeps balanced mode near 15 CPU
+            # samples/sec, avoiding redundant work without over-skipping
+            # lower-frame-rate camera clips.
             frame_stride = 1 if device == "0" else 2
             image_sizes = {
                 camera: (640 if camera == "turning" else 512) if device == "0" else (512 if camera == "turning" else 416)
