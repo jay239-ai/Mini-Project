@@ -415,7 +415,9 @@ def download_analysis_report(job_id: str) -> Response:
     report_path = JOB_ROOT / job_id / "session_report.pdf"
     if not report_path.is_file():
         raise HTTPException(status_code=404, detail="The PDF report is not ready or has expired.")
-    return Response(content=report_path.read_bytes(), media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="traffic-analysis-{job_id[:12]}.pdf"', "Cache-Control": "no-store"})
+    # The UI downloads only after an explicit button click. Inline disposition
+    # prevents a stale or stray navigation from silently downloading the PDF.
+    return Response(content=report_path.read_bytes(), media_type="application/pdf", headers={"Content-Disposition": f'inline; filename="traffic-analysis-{job_id[:12]}.pdf"', "Cache-Control": "no-store"})
 
 
 def _analyze_camera(

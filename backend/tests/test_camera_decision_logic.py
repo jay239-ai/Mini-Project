@@ -162,6 +162,15 @@ class ConfirmedTrackCountingTests(unittest.TestCase):
         self.assertFalse(analyzer.metrics.turn_path_blocked_now)
         self.assertEqual(analyzer.metrics.turn_path_stationary_vehicle_count_now, 0)
 
+    def test_slow_small_turn_path_vehicle_is_not_misclassified_as_stationary(self) -> None:
+        analyzer = TrafficAnalyzer("turning", [], blockage_threshold_s=2.0)
+        for sample in range(13):
+            x = sample * 3
+            car = Detection(12, "car", 0.9, (x, 10, x + 12, 22))
+            analyzer.update([car], sample * 0.5)
+        self.assertFalse(analyzer.metrics.turn_path_blocked_now)
+        self.assertEqual(analyzer.metrics.turn_path_stationary_vehicle_count_now, 0)
+
     def test_free_left_queue_span_is_measured_separately(self) -> None:
         main_lane = Zone("main_approach", ((0, 0), (100, 0), (100, 100), (0, 100)), "approach")
         free_left = Zone("free_left_lane", ((50, 0), (100, 0), (100, 100), (50, 100)), "free_left")

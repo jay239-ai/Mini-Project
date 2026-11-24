@@ -220,7 +220,7 @@
     document.getElementById(cameraViews[cameraIndex].status).textContent = 'Clip selected';
     document.getElementById(cameraViews[cameraIndex].observations).textContent = 'Clip ready · counts appear as soon as analysis starts.';
     if (cameraIndex === 2) $('#joiningFlowStatus').textContent = 'Joining-road movement: click Analyze to classify moving and stopped vehicles.';
-    $('#downloadReportLink').hidden = true;
+    $('#downloadReportButton').hidden = true;
     renderDecision({ severity: 'insufficient', confidence: 'low', reason: 'New camera clips selected. Run analysis to calculate the current traffic condition.' });
     updateUploadState();
   }
@@ -344,12 +344,16 @@
 
   function renderAnalysis(jobId, result = {}) {
     renderDecision(result.junction_decision || {});
-    const reportLink = $('#downloadReportLink');
+    const reportLink = $('#downloadReportButton');
     if (result.report_url) {
-      reportLink.href = result.report_url;
-      reportLink.download = `traffic-analysis-${jobId.slice(0, 12)}.pdf`;
+      reportLink.dataset.reportUrl = result.report_url;
+      reportLink.dataset.filename = `traffic-analysis-${jobId.slice(0, 12)}.pdf`;
       reportLink.hidden = false;
-    } else reportLink.hidden = true;
+    } else {
+      delete reportLink.dataset.reportUrl;
+      delete reportLink.dataset.filename;
+      reportLink.hidden = true;
+    }
     if (result.historical_context) renderHistory(result.historical_context);
     $('#sourceStatus').textContent = result.data_status === 'complete' ? 'ANALYSIS COMPLETE' : 'PARTIAL ANALYSIS';
   }
@@ -364,7 +368,7 @@
     $('#stopAnalysisBtn').disabled = false;
     setControlsLocked(true);
     resetTrackingViews();
-    $('#downloadReportLink').hidden = true;
+    $('#downloadReportButton').hidden = true;
     $('#analysisProgress').hidden = false;
     renderDecision({ severity: 'insufficient', confidence: 'low', reason: 'Collecting up to two seconds of initial camera evidence; person-in-path alerts are immediate.' });
     $('#analysisStatus').textContent = 'Uploading clips now · analysis starts automatically when they arrive';
@@ -390,7 +394,7 @@
       const lastFrameSequences = { approach: 0, turning: 0, exit: 0 };
       let job;
       do {
-        await pause(33);
+        await pause(200);
         job = await apiJson(`/api/v1/analysis/${started.job_id}`);
         $('#progressLabel').textContent = job.stop_requested ? 'Stopping after current frame…' : job.message || 'Analyzing camera views';
         $('#analysisStatus').textContent = job.stop_requested || stopRequested ? 'Stopping analysis safely…' : `${job.message || 'Analyzing'}${job.compute_device ? ` · ${job.compute_device}` : ''}`;
@@ -490,7 +494,7 @@
     resetTrackingViews();
     $('#analysisProgress').hidden = false;
     $('#progressLabel').textContent = 'Starting live streams';
-    $('#downloadReportLink').hidden = true;
+    $('#downloadReportButton').hidden = true;
     renderDecision({ severity: 'insufficient', confidence: 'low', reason: 'Collecting up to two seconds of initial camera evidence; person-in-path alerts are immediate.' });
     try {
       if (stopRequested) return;
@@ -507,7 +511,7 @@
       const lastFrameSequences = { approach: 0, turning: 0, exit: 0 };
       let job;
       do {
-        await pause(33);
+        await pause(200);
         job = await apiJson(`/api/v1/analysis/${activeLiveJobId}`);
         $('#analysisProgress').hidden = job.status === 'streaming';
         $('#analysisStatus').textContent = job.stop_requested || stopRequested ? 'Stopping camera streams safely…' : job.message || 'Live camera analysis';
@@ -569,6 +573,28 @@
   applySourceMode();
   inputs.forEach((id, index) => document.getElementById(id).addEventListener('change', (event) => showLocalVideo(event.target.files[0] || null, index)));
   $('#reportUpload').addEventListener('change', (event) => importReport(event.target.files[0]));
+  $('#downloadReportButton').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    const reportUrl = button.dataset.reportUrl;
+    if (!reportUrl || button.disabled) return;
+    button.disabled = true;
+    try {
+      const response = await fetch(reportUrl, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`Report download failed (${response.status}).`);
+      const blobUrl = URL.createObjectURL(await response.blob());
+      const anchor = document.createElement('a');
+      anchor.href = blobUrl;
+      anchor.download = button.dataset.filename || 'traffic-analysis.pdf';
+      document.body.append(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(blobUrl), 30000);
+    } catch (error) {
+      notify(error.message);
+    } finally {
+      button.disabled = false;
+    }
+  });
   $('#siteLabelInput')?.addEventListener('change', loadHistory);
   $('#siteLabelInput')?.addEventListener('input', updateSiteLabel);
   $('#analyzeBtn').addEventListener('click', runRecordedAnalysis);

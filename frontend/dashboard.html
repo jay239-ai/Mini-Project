@@ -7,7 +7,7 @@
   <meta name="description" content="Analyze traffic camera views and review explainable junction advisories with site-specific history.">
   <title>Traffic Analysis | Free-Left Monitor</title>
   <link rel="stylesheet" href="css/style.css?v=live-decision-2">
-  <script src="js/app.js?v=recorded-recovery-3" defer></script>
+  <script src="js/app.js?v=manual-report-slow-motion-1" defer></script>
 </head>
 <body class="dashboard">
   <aside class="sidebar" aria-label="Main navigation">
@@ -68,7 +68,7 @@
       </article>
 
       <article class="panel decision-panel">
-        <div class="panel-heading"><div><p class="eyebrow">TRAFFIC CONDITION · ADVISORY ONLY</p><h2>Junction status</h2></div><a class="button button-small button-secondary" id="downloadReportLink" href="#" hidden>Download analysis report</a></div>
+        <div class="panel-heading"><div><p class="eyebrow">TRAFFIC CONDITION · ADVISORY ONLY</p><h2>Junction status</h2></div><button class="button button-small button-secondary" id="downloadReportButton" type="button" hidden>Download analysis report</button></div>
         <div class="traffic-advisory">
           <div class="traffic-lamp" id="trafficLamp" data-state="unknown" role="img" aria-label="Traffic condition waiting for camera data"><i class="lamp-red"></i><i class="lamp-yellow"></i><i class="lamp-green"></i></div>
           <div><strong id="trafficStateLabel">WAITING FOR DATA</strong><p id="decisionReason">Start an analysis to see whether current traffic conditions are green, yellow or red.</p><small id="decisionEvidence">This is a traffic-condition advisory, not a command to real signal hardware.</small></div>

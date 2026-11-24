@@ -72,7 +72,9 @@ class UltralyticsByteTrackDetector:
         }
         if self.device:
             options["device"] = self.device
-            options["half"] = self.device != "cpu"
+            # Ultralytics replaced the deprecated ``half`` flag with
+            # ``quantize``. Passing ``half=False`` warned on every CPU frame.
+            options["quantize"] = 16 if self.device != "cpu" else None
         results = self.model.track(frame, **options)
         if not results:
             return []

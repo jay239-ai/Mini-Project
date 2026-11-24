@@ -477,7 +477,10 @@ class TrafficAnalyzer:
 
         width = max(0.0, box[2] - box[0])
         height = max(0.0, box[3] - box[1])
-        return max(self.stationary_speed_px_s, (width * width + height * height) ** 0.5 * 0.12)
+        # A fixed 8 px/s floor classified small, distant vehicles as stopped
+        # even while visibly moving. Keep a modest jitter floor and scale with
+        # object size so slow approaches remain moving.
+        return max(min(self.stationary_speed_px_s, 3.0), (width * width + height * height) ** 0.5 * 0.08)
 
     def _nearby_fragment(
         self,

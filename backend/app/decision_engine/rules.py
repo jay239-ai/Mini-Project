@@ -140,12 +140,25 @@ def recommend(
         active_overlap = item.get("pedestrian_vehicle_overlap_now") is True
         path_obstructed = role == "turning" and item.get("turn_path_blocked_now") is True
         if path_obstructed or route_pedestrian or active_overlap:
-            reason = (
-                f"The turn path has a pedestrian or a vehicle stopped long enough to block it. Wait for the path to clear for {rules.pedestrian_clearance_hold_seconds:g} seconds."
-                if path_obstructed else f"A person is present in the camera 1 free-left turn path. Hold the turn until the path is clear for {rules.pedestrian_clearance_hold_seconds:g} seconds."
-                if route_pedestrian else
-                f"A pedestrian and vehicle were recently together in a configured conflict area. Hold the turn for the {rules.pedestrian_clearance_hold_seconds:g}-second clearance interval."
-            )
+            turn_path_count = int(item.get("turn_path_obstruction_count_now", 0) or 0)
+            route_count = int(item.get("pedestrian_in_free_left_route_count_now", 0) or 0)
+            if path_obstructed:
+                reason = (
+                    f"The turn path was recently obstructed; its {rules.pedestrian_clearance_hold_seconds:g}-second clearance interval is still active."
+                    if turn_path_count == 0 else
+                    f"The turn path currently has a pedestrian or a vehicle stopped long enough to block it. Wait for {rules.pedestrian_clearance_hold_seconds:g} seconds after it clears."
+                )
+                red_label = "RED · CLEARANCE HOLD" if turn_path_count == 0 else "RED · TURN PATH BLOCKED"
+            elif route_pedestrian:
+                reason = (
+                    f"A person was recently detected in camera 1's free-left path; waiting for the {rules.pedestrian_clearance_hold_seconds:g}-second clearance interval."
+                    if route_count == 0 else
+                    "A person is currently detected in camera 1's free-left turn path."
+                )
+                red_label = "RED · CLEARANCE HOLD" if route_count == 0 else "RED · PERSON IN FREE-LEFT PATH"
+            else:
+                reason = f"A pedestrian and vehicle were recently together in a configured conflict area. Hold the turn for the {rules.pedestrian_clearance_hold_seconds:g}-second clearance interval."
+                red_label = "RED · PEDESTRIAN CONFLICT"
             urgent = _empty("high", reason, camera_count=len(camera_metrics), warnings=[])
             urgent.update(
                 recommended_action="hold_free_left_for_pedestrian_clearance",
@@ -153,15 +166,15 @@ def recommend(
                 decision_status="operator_review_required",
                 traffic_light={
                     "color": "red",
-                    "label": "RED · TURN PATH BLOCKED" if path_obstructed else "RED · PERSON IN FREE-LEFT PATH" if route_pedestrian else "RED · PEDESTRIAN CONFLICT",
-                    "evidence_quality": "A pedestrian or sustained stationary vehicle obstruction is present; wait for the clearance interval.",
+                    "label": red_label,
+                    "evidence_quality": "A current obstruction is detected." if turn_path_count or route_count or active_overlap else "The last obstruction is no longer counted in the current frame; the short clearance hold remains active.",
                 },
                 input_metrics={
                     "pedestrian_in_free_left_route_now": route_pedestrian,
-                    "pedestrians_in_free_left_route_now": int(item.get("pedestrian_in_free_left_route_count_now", 0) or 0),
+                    "pedestrians_in_free_left_route_now": route_count,
                     "pedestrian_vehicle_overlap_now": active_overlap,
                     "pedestrian_vehicle_overlap_samples": int(conflict_samples),
-                    "turn_path_obstruction_count_now": int(item.get("turn_path_obstruction_count_now", 0) or 0),
+                    "turn_path_obstruction_count_now": turn_path_count,
                     "pedestrian_clearance_hold_seconds": rules.pedestrian_clearance_hold_seconds,
                     "camera_id": item["camera_id"],
                 },
