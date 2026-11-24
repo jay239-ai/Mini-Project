@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import uuid
+from urllib.parse import urlparse
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -250,8 +251,8 @@ def analysis_capabilities() -> dict[str, Any]:
         "missing_dependencies": missing,
         "compute_device": "GPU" if cuda_available else "CPU" if not missing else None,
         "live_camera_ready": not missing,
-        "input_modes": ["uploaded_video", "local_usb_camera"],
-        "note": "Live sources are locally attached camera devices exposed to Windows as USB webcams.",
+        "input_modes": ["uploaded_video", "local_usb_camera", "rtsp_camera", "http_camera"],
+        "note": "Live sources can use locally attached USB webcams or RTSP/RTSPS/HTTP/HTTPS streams readable by OpenCV.",
     }
 
 
@@ -268,9 +269,9 @@ def list_local_cameras() -> dict[str, Any]:
 
 @router.post("/live/start", status_code=202, tags=["live analysis"])
 async def start_live_analysis(
-    camera1: int | None = Form(None),
-    camera2: int | None = Form(None),
-    camera3: int | None = Form(None),
+    camera1: str | None = Form(None),
+    camera2: str | None = Form(None),
+    camera3: str | None = Form(None),
     performance_profile: str = Form("fast"),
     site_label: str = Form(DEFAULT_SITE_LABEL, min_length=1, max_length=120),
 ) -> dict[str, Any]:
@@ -281,15 +282,27 @@ async def start_live_analysis(
     site_label = site_label.strip()
     if not site_label:
         raise HTTPException(status_code=400, detail="Enter the intersection/site name.")
-    device_map = {camera: device_index for camera, device_index in zip(CAMERAS, (camera1, camera2, camera3)) if device_index is not None}
+    device_map: dict[str, int | str] = {}
+    for camera, raw_source in zip(CAMERAS, (camera1, camera2, camera3)):
+        if raw_source is None or not raw_source.strip():
+            continue
+        source = raw_source.strip()
+        if source.isdecimal():
+            device_index = int(source)
+            if device_index >= 8:
+                raise HTTPException(status_code=400, detail="Choose a camera from the connected-device list and scan again if it is missing.")
+            device_map[camera] = device_index
+            continue
+        parsed = urlparse(source)
+        if parsed.scheme.lower() not in {"rtsp", "rtsps", "http", "https"} or not parsed.hostname:
+            raise HTTPException(status_code=400, detail="Camera sources must be discovered USB devices or RTSP/RTSPS/HTTP/HTTPS stream URLs.")
+        device_map[camera] = source
     if not device_map:
-        raise HTTPException(status_code=400, detail="Select at least one connected USB camera.")
+        raise HTTPException(status_code=400, detail="Select at least one USB camera or enter a network camera stream URL.")
     if len(set(device_map.values())) != len(device_map):
         raise HTTPException(status_code=400, detail="Each live camera view must use a different device.")
-    if any(not isinstance(index, int) or index < 0 or index >= 8 for index in device_map.values()):
-        raise HTTPException(status_code=400, detail="Choose a camera from the connected-device list and scan again if it is missing.")
     with LIVE_SESSION_LOCK:
-        if any(job.get("source_mode") == "live_usb_camera" and job.get("status") in {"initializing", "streaming", "stopping"} for job in JOBS.values()):
+        if any(job.get("source_mode") in {"live_usb_camera", "live_camera"} and job.get("status") in {"initializing", "streaming", "stopping"} for job in JOBS.values()):
             raise HTTPException(status_code=409, detail="A live camera session is already running. Stop it before starting another.")
     # Keep the start request lightweight: probing CUDA imports torch and can
     # block the button response. The worker initializes the runtime and reports
@@ -303,12 +316,13 @@ async def start_live_analysis(
     stop_event = threading.Event()
     job: dict[str, Any] = {
         "job_id": job_id,
-        "source_mode": "live_usb_camera",
+        "source_mode": "live_camera",
         "status": "initializing",
-        "message": "Opening attached USB camera feeds",
+        "message": "Opening camera sources",
         "performance_profile": performance_profile,
         "site_label": site_label,
         "camera_count": len(device_map),
+        "camera_sources": {camera: ("network_stream" if isinstance(source, str) else "usb_camera") for camera, source in device_map.items()},
         "active_cameras": list(device_map),
         "camera_states": {camera: "connecting" if camera in device_map else "not_connected" for camera in CAMERAS},
         "camera_progress": {camera: 0 for camera in CAMERAS},
@@ -506,6 +520,44 @@ def _analyze_camera(
     return camera_index, summary
 
 
+def _finalize_early_stopped_job(
+    job_id: str,
+    job: dict[str, Any],
+    output_dir: Path,
+    site_label: str,
+    performance_profile: str,
+    message: str,
+) -> None:
+    """Persist a useful partial PDF even when stop arrives before the first frame."""
+
+    result: dict[str, Any] = {
+        "session_mode": "recorded",
+        "performance_profile": performance_profile,
+        "site_label": site_label,
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "camera_count": 0,
+        "data_status": "partial",
+        "camera_results": [],
+        "cross_camera_identity": {},
+        "historical_context": _site_history(site_label),
+        "junction_decision": job.get("decision", {"severity": "insufficient", "reason": message}),
+        "decision_timing": dict(job.get("decision_timing", {})),
+        "decision_timeline": list(job.get("decision_timeline", [])),
+        "limitations": [message, "No camera frames were available, so no traffic measurements were produced."],
+    }
+    try:
+        generate_session_pdf(result, output_dir / "session_report.pdf")
+        result["report_url"] = f"/api/v1/analysis/{job_id}/report.pdf"
+    except Exception as error:
+        LOGGER.exception("Could not create early-stop report for %s", job_id)
+        result["report_error"] = str(error)
+    try:
+        (output_dir / "session_summary.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    except OSError:
+        LOGGER.exception("Could not save early-stop summary for %s", job_id)
+    job.update(status="stopped", message=message, result=result, junction_decision=result["junction_decision"])
+
+
 def _run_job(job_id: str, input_dir: Path, paths: list[Path], performance_profile: str = "fast", site_label: str = DEFAULT_SITE_LABEL, stop_event: threading.Event | None = None) -> None:
     job = JOBS[job_id]
     stop_event = stop_event or threading.Event()
@@ -513,7 +565,7 @@ def _run_job(job_id: str, input_dir: Path, paths: list[Path], performance_profil
     output_dir.mkdir(parents=True, exist_ok=True)
     try:
         if stop_event.is_set():
-            job.update(status="stopped", message="Analysis stopped before processing began")
+            _finalize_early_stopped_job(job_id, job, output_dir, site_label, performance_profile, "Analysis stopped before processing began.")
             return
         job.update(status="initializing", message="Checking the detection runtime")
         config = json.loads(ZONE_CONFIG.read_text(encoding="utf-8"))
@@ -551,7 +603,7 @@ def _run_job(job_id: str, input_dir: Path, paths: list[Path], performance_profil
         )
         LOGGER.info("Analysis job %s: device=%s, torch_threads_per_camera=%s, frame_stride=%s, image_sizes=%s", job_id, device, torch_threads, frame_stride, image_sizes)
         if stop_event.is_set():
-            job.update(status="stopped", message="Analysis stopped before frame processing")
+            _finalize_early_stopped_job(job_id, job, output_dir, site_label, performance_profile, "Analysis stopped before any video frames were processed.")
             return
         summaries: list[dict[str, Any] | None] = [None] * len(CAMERAS)
         update_lock: threading.Lock = job["_update_lock"]
@@ -585,9 +637,9 @@ def _run_job(job_id: str, input_dir: Path, paths: list[Path], performance_profil
             "decision_timeline": list(job.get("decision_timeline", [])),
             "limitations": ["Cross-camera matches are conservative appearance matches, not ground-truth identities; synchronized clips are required and uncertain matches remain separate.", "Queue extent is image-plane pixels; physical length and calibrated speed require a road-plane calibration and stop-line location.", "Example camera zones must be calibrated to actual road views; the advisory does not operate a traffic signal."],
         }
+        generate_session_pdf(result, output_dir / "session_report.pdf")
         result["report_url"] = f"/api/v1/analysis/{job_id}/report.pdf"
         (output_dir / "session_summary.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
-        generate_session_pdf(result, output_dir / "session_report.pdf")
         final_status = "stopped" if stop_event.is_set() else "complete"
         job.update(status=final_status, message="Analysis stopped; partial evidence is shown." if stop_event.is_set() else "Analysis complete", progress_percent=round(sum(job.get("camera_progress", {}).values()) / len(CAMERAS)), result=result, junction_decision=decision, decision=decision)
     except Exception as error:
@@ -597,7 +649,7 @@ def _run_job(job_id: str, input_dir: Path, paths: list[Path], performance_profil
         shutil.rmtree(input_dir, ignore_errors=True)
 
 
-def _run_live_job(job_id: str, device_map: dict[str, int], performance_profile: str) -> None:
+def _run_live_job(job_id: str, device_map: dict[str, int | str], performance_profile: str) -> None:
     """Run independent latest-frame camera workers and update a live advisory."""
 
     job = JOBS[job_id]
@@ -638,7 +690,7 @@ def _run_live_job(job_id: str, device_map: dict[str, int], performance_profile: 
     decision_thresholds = _decision_thresholds(config)
     job["historical_context"] = history_context
     source_started_at = time.perf_counter()
-    job.update(status="streaming", message="Connecting to USB cameras", compute_device="GPU 0" if device == "0" else "CPU", image_size=image_size, camera_states={camera: "connecting" if camera in device_map else "not_connected" for camera in CAMERAS})
+    job.update(status="streaming", message="Connecting to camera sources", compute_device="GPU 0" if device == "0" else "CPU", image_size=image_size, camera_states={camera: "connecting" if camera in device_map else "not_connected" for camera in CAMERAS})
 
     def on_state(camera_id: str, state: str, model_load_seconds: float | None) -> None:
         with update_lock:
@@ -702,6 +754,20 @@ def _run_live_job(job_id: str, device_map: dict[str, int], performance_profile: 
             job["frame_sequences"][camera_id] += 1
             job["live_counts_by_camera"][camera_id] = counts
 
+    def on_preview(camera_id: str, frame: Any) -> None:
+        """Publish a first raw frame while the per-camera detector is loading."""
+        height, width = frame.shape[:2]
+        scale = min(1.0, 640 / max(width, height))
+        if scale < 1:
+            frame = cv2.resize(frame, (int(width * scale), int(height * scale)))
+        frame = _draw_performance_hud(cv2, frame.copy(), ["CAMERA CONNECTED  |  LOADING TRACKING MODEL"])
+        encoded, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        if not encoded:
+            return
+        with update_lock:
+            job["preview_jpegs"][camera_id] = buffer.tobytes()
+            job["frame_sequences"][camera_id] += 1
+
     errors: list[str] = []
     summaries: dict[str, dict[str, Any]] = {}
     try:
@@ -718,6 +784,7 @@ def _run_live_job(job_id: str, device_map: dict[str, int], performance_profile: 
                     image_size=image_size,
                     identity_time_offset_s=float(config.get("camera_clock_offsets_seconds", {}).get(camera_id, 0.0)),
                     on_state=lambda state, load, cam=camera_id: on_state(cam, state, load),
+                    on_preview=lambda frame, cam=camera_id: on_preview(cam, frame),
                     on_update=lambda frame, counts, tracks, metrics, cam=camera_id: on_update(cam, frame, counts, tracks, metrics),
                 ): camera_id
                 for camera_id, device_index in device_map.items()
@@ -749,7 +816,7 @@ def _run_live_job(job_id: str, device_map: dict[str, int], performance_profile: 
         job["junction_decision"] = recommend(decision_metrics, decision_thresholds, history_context, job.get("live_identity", {}))
         _publish_job_decision(job, job["junction_decision"])
         result = {
-            "session_mode": "live_usb_camera",
+            "session_mode": "live_camera",
             "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "site_label": site_label,
             "camera_count": len(summaries),
@@ -760,13 +827,13 @@ def _run_live_job(job_id: str, device_map: dict[str, int], performance_profile: 
             "decision_timing": dict(job.get("decision_timing", {})),
             "decision_timeline": list(job.get("decision_timeline", [])),
             "limitations": ["Live reports contain measurements collected before stop; a failed or missing camera makes the junction advisory incomplete.", "Camera-local tracking and appearance-based cross-camera matches are estimates, not ground-truth identities.", "The advisory is for human review and does not control traffic signals."],
-            "report_url": f"/api/v1/analysis/{job_id}/report.pdf",
         }
         try:
             output_dir = JOB_ROOT / job_id
             output_dir.mkdir(parents=True, exist_ok=True)
-            (output_dir / "session_summary.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
             generate_session_pdf(result, output_dir / "session_report.pdf")
+            result["report_url"] = f"/api/v1/analysis/{job_id}/report.pdf"
+            (output_dir / "session_summary.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         except Exception as error:
             LOGGER.exception("Could not create live report for %s", job_id)
             result["report_error"] = str(error)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from urllib.parse import urlparse
 from typing import Any, Callable
 
 from vision_engine.camera.video_analysis import _draw_overlay
@@ -17,21 +18,39 @@ TARGET_FPS = 30
 class LatestFrameSource:
     """Continuously drain a webcam and retain only its newest frame."""
 
-    def __init__(self, device_index: int, stop_event: threading.Event) -> None:
+    def __init__(self, device_index: int | str, stop_event: threading.Event) -> None:
         import cv2
 
         self.cv2 = cv2
         self.stop_event = stop_event
-        self.capture = cv2.VideoCapture(device_index, cv2.CAP_DSHOW)
-        if not self.capture.isOpened():
+        self.device_index = device_index
+        if isinstance(device_index, str):
+            parsed = urlparse(device_index)
+            if parsed.scheme.lower() not in {"rtsp", "rtsps", "http", "https"} or not parsed.hostname:
+                raise ValueError("Network cameras must use a valid RTSP, RTSPS, HTTP, or HTTPS stream URL.")
+            timeout_params = [
+                cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000,
+                cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000,
+            ]
+            try:
+                self.capture = cv2.VideoCapture(device_index, cv2.CAP_FFMPEG, timeout_params)
+            except (TypeError, cv2.error):
+                self.capture = cv2.VideoCapture(device_index, cv2.CAP_FFMPEG)
+            if not self.capture.isOpened():
+                self.capture.release()
+                self.capture = cv2.VideoCapture(device_index)
+        else:
+            self.capture = cv2.VideoCapture(device_index, cv2.CAP_DSHOW)
+        if not self.capture.isOpened() and isinstance(device_index, int):
             self.capture.release()
             self.capture = cv2.VideoCapture(device_index, cv2.CAP_MSMF)
-        if not self.capture.isOpened():
+        if not self.capture.isOpened() and isinstance(device_index, int):
             self.capture.release()
             self.capture = cv2.VideoCapture(device_index)
         if not self.capture.isOpened():
             self.capture.release()
-            raise RuntimeError(f"Could not open local camera device {device_index}. Enable the phone's USB webcam mode and check Windows camera access.")
+            source_kind = "network stream" if isinstance(device_index, str) else f"local camera device {device_index}"
+            raise RuntimeError(f"Could not open {source_kind}. Check the address, availability, and camera credentials.")
         self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
@@ -40,7 +59,8 @@ class LatestFrameSource:
         self.latest: tuple[Any, int, float] | None = None
         self.error: str | None = None
         self.sequence = 0
-        self.thread = threading.Thread(target=self._read_loop, name=f"usb-camera-{device_index}", daemon=True)
+        thread_name = f"network-camera" if isinstance(device_index, str) else f"usb-camera-{device_index}"
+        self.thread = threading.Thread(target=self._read_loop, name=thread_name, daemon=True)
         self.thread.start()
 
     def _read_loop(self) -> None:
@@ -103,7 +123,7 @@ def enumerate_usb_cameras(max_devices: int = 8) -> list[dict[str, int]]:
 def run_live_camera(
     *,
     camera_id: str,
-    device_index: int,
+    device_index: int | str,
     source_started_at: float,
     stop_event: threading.Event,
     config: dict[str, Any],
@@ -111,17 +131,14 @@ def run_live_camera(
     image_size: int,
     identity_time_offset_s: float,
     on_state: Callable[[str, float | None], None],
+    on_preview: Callable[[Any], None],
     on_update: Callable[[Any, dict[str, Any], list[dict[str, Any]], dict[str, Any] | None], None],
 ) -> dict[str, Any]:
-    """Infer on the newest USB frame, dropping stale capture frames by design."""
+    """Show a camera frame immediately, then infer on newest frames without a stale queue."""
 
     source = LatestFrameSource(device_index, stop_event)
+    source_label: int | str = device_index if isinstance(device_index, int) else "network_stream"
     try:
-        on_state("loading_model", None)
-        model_started = time.perf_counter()
-        detector: Detector = UltralyticsByteTrackDetector(image_size=image_size, device=device)
-        model_load_seconds = time.perf_counter() - model_started
-        on_state("waiting_for_frame", model_load_seconds)
         first_frame: tuple[Any, int, float] | None = None
         wait_until = time.perf_counter() + 5.0
         while first_frame is None and time.perf_counter() < wait_until and not stop_event.is_set():
@@ -132,13 +149,22 @@ def run_live_camera(
                 time.sleep(0.02)
         if first_frame is None:
             if stop_event.is_set():
-                return {"camera_id": camera_id, "device_index": device_index, "status": "stopped", "inference_frames": 0}
-            raise RuntimeError(f"No frames arrived from camera device {device_index}.")
+                return {"camera_id": camera_id, "device_index": source_label, "status": "stopped", "inference_frames": 0}
+            raise RuntimeError("No frames arrived from the selected camera source.")
+
+        height, width = first_frame[0].shape[:2]
+        if width < 2 or height < 2:
+            raise RuntimeError(f"Camera returned an invalid {width}x{height} frame.")
+
+        # Publish the raw image before loading YOLO so users can distinguish a
+        # working camera connection from a slow model start.
+        on_preview(first_frame[0])
+        on_state("loading_model", None)
+        model_started = time.perf_counter()
+        detector: Detector = UltralyticsByteTrackDetector(image_size=image_size, device=device)
+        model_load_seconds = time.perf_counter() - model_started
 
         frame, _, _ = first_frame
-        height, width = frame.shape[:2]
-        if width < 2 or height < 2:
-            raise RuntimeError(f"Camera device {device_index} returned an invalid {width}x{height} frame.")
         reference_width, reference_height = config.get("reference_resolution", [1280, 720])
         if len(config.get("reference_resolution", [])) != 2 or reference_width <= 0 or reference_height <= 0:
             raise ValueError("Camera zone reference_resolution must contain two positive dimensions.")
@@ -269,7 +295,7 @@ def run_live_camera(
                 last_preview_at = now
         duration = max(0.0, time.perf_counter() - source_started_at)
         summary = analyzer.finish(duration)
-        summary.update({"camera_id": camera_id, "device_index": device_index, "model_load_seconds": round(model_load_seconds, 2), "inference_frames": inference_frames, "inference_fps": round(inference_frames / max(inference_seconds, 0.001), 2), "end_to_end_fps": round(inference_frames / max(time.perf_counter() - loop_started, 0.001), 2)})
+        summary.update({"camera_id": camera_id, "device_index": source_label, "model_load_seconds": round(model_load_seconds, 2), "inference_frames": inference_frames, "inference_fps": round(inference_frames / max(inference_seconds, 0.001), 2), "end_to_end_fps": round(inference_frames / max(time.perf_counter() - loop_started, 0.001), 2)})
         return summary
     finally:
         source.close()
