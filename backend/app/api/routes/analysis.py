@@ -23,10 +23,10 @@ from fastapi.responses import Response
 from backend.app.decision_engine.rules import DecisionThresholds, recommend, valid_zone_configuration
 from backend.app.reporting.session_pdf import generate_session_pdf
 from backend.app.reporting.historical_reports import get_site_history
-from vision_engine.camera.video_analysis import TARGET_FPS, analyze_video, _draw_performance_hud
+from vision_engine.camera.video_analysis import TARGET_FPS, analyze_video, open_video_capture, _draw_performance_hud
 from vision_engine.camera.live_capture import enumerate_usb_cameras, run_live_camera
-from vision_engine.detection.yolo import UltralyticsByteTrackDetector
-from vision_engine.roi.zones import zones_from_mapping
+from vision_engine.detection.yolo import TRAFFIC_CLASS_IDS, UltralyticsByteTrackDetector
+from vision_engine.roi.zones import Zone, zones_from_mapping
 from vision_engine.metrics.cross_camera import associate_camera_tracks, LiveCrossCameraAssociator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
@@ -121,6 +121,8 @@ def _decision_thresholds(config: dict[str, Any]) -> DecisionThresholds:
         score_medium=int(values.get("risk_score_medium", 35)),
         score_high=int(values.get("risk_score_high", 65)),
         joining_flow_stationary_ratio_medium=float(values.get("joining_flow_stationary_ratio_medium", 0.65)),
+        queue_length_medium_ratio=float(values.get("queue_length_medium_ratio", 0.35)),
+        queue_length_high_ratio=float(values.get("queue_length_high_ratio", 0.65)),
         minimum_observation_seconds=float(values.get("minimum_observation_seconds", 2.0)),
         minimum_confidence_frames_per_camera=int(values.get("minimum_confidence_frames_per_camera", 30)),
         pedestrian_clearance_hold_seconds=float(values.get("pedestrian_clearance_hold_seconds", 2.0)),
@@ -142,6 +144,10 @@ def _validate_zone_config(config: dict[str, Any]) -> None:
         rows = cameras.get(camera_id)
         if not isinstance(rows, list) or not valid_zone_configuration(camera_id, rows):
             raise ValueError(f"Camera zone configuration for {camera_id} is missing required zones.")
+        # Camera 2 and 3 are intentionally full-frame views. Ignore any legacy
+        # polygons in those entries; only camera 1's free-left ROI is consumed.
+        if camera_id != "approach":
+            continue
         names: set[str] = set()
         for row in rows:
             if not isinstance(row, dict):
@@ -164,7 +170,25 @@ def _validate_zone_config(config: dict[str, Any]) -> None:
             twice_area = abs(sum(points[i][0] * points[(i + 1) % len(points)][1] - points[(i + 1) % len(points)][0] * points[i][1] for i in range(len(points))))
             if twice_area == 0:
                 raise ValueError(f"Camera zone '{name}' has zero polygon area.")
+        if camera_id == "approach":
+            lane = next(row for row in rows if row.get("kind") == "approach")
+            free_left = next(row for row in rows if row.get("kind") == "free_left")
+            lane_zone = Zone(
+                str(lane["name"]),
+                tuple((int(point[0]), int(point[1])) for point in lane["polygon"]),
+                "approach",
+            )
+            if not all(lane_zone.contains((int(point[0]), int(point[1]))) for point in free_left["polygon"]):
+                raise ValueError("Camera 1 free_left polygon must sit inside the main approach-lane polygon.")
     _decision_thresholds(config)
+
+
+def _zones_for_analysis(camera_id: str, zone_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Use the approach-lane and free-left ROIs only on camera 1."""
+
+    if camera_id == "approach":
+        return [zone for zone in zone_rows if zone.get("kind") in {"approach", "free_left"}]
+    return []
 
 
 @router.post("/recorded", status_code=202)
@@ -172,7 +196,7 @@ async def start_recorded_analysis(
     camera1: UploadFile = File(...),
     camera2: UploadFile = File(...),
     camera3: UploadFile = File(...),
-    performance_profile: str = Form("fast"),
+    performance_profile: str = Form("balanced"),
     site_label: str = Form(DEFAULT_SITE_LABEL, min_length=1, max_length=120),
 ) -> dict[str, str]:
     """Accept three recorded clips and process them outside the request thread."""
@@ -272,7 +296,7 @@ async def start_live_analysis(
     camera1: str | None = Form(None),
     camera2: str | None = Form(None),
     camera3: str | None = Form(None),
-    performance_profile: str = Form("fast"),
+    performance_profile: str = Form("balanced"),
     site_label: str = Form(DEFAULT_SITE_LABEL, min_length=1, max_length=120),
 ) -> dict[str, Any]:
     """Start continuous local camera processing with latest-frame buffering."""
@@ -414,17 +438,27 @@ def _analyze_camera(
     import cv2
 
     job = JOBS[job_id]
-    camera_zones = config["cameras"][camera_id]
+    camera_zones = _zones_for_analysis(camera_id, config["cameras"][camera_id])
     reference_width, reference_height = config.get("reference_resolution", [1280, 720])
-    capture = cv2.VideoCapture(str(source_path))
-    if not capture.isOpened():
-        raise RuntimeError(f"Could not open uploaded clip for {camera_id}.")
+    capture = open_video_capture(cv2, source_path)
+    preview_ok, first_frame = capture.read()
     frame_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     source_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0)
     capture.release()
     if min(frame_width, frame_height, reference_width, reference_height) <= 0:
         raise RuntimeError(f"Invalid frame or zone reference size for {camera_id}.")
+    if preview_ok and first_frame is not None:
+        preview_height, preview_width = first_frame.shape[:2]
+        preview_scale = min(1.0, 640 / max(preview_width, preview_height))
+        if preview_scale < 1:
+            first_frame = cv2.resize(first_frame, (int(preview_width * preview_scale), int(preview_height * preview_scale)))
+        first_frame = _draw_performance_hud(cv2, first_frame, [f"{camera_id.upper()} CLIP READY · LOADING TRACKING MODEL"])
+        encoded, preview_buffer = cv2.imencode(".jpg", first_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        if encoded:
+            with update_lock:
+                job["preview_jpegs"][camera_id] = preview_buffer.tobytes()
+                job["frame_sequences"][camera_id] += 1
     if TARGET_FPS < source_fps < 1000:
         frame_stride = max(frame_stride, round(source_fps / TARGET_FPS))
     scale_x, scale_y = frame_width / reference_width, frame_height / reference_height
@@ -432,9 +466,9 @@ def _analyze_camera(
         {**zone, "polygon": [[round(point[0] * scale_x), round(point[1] * scale_y)] for point in zone["polygon"]]}
         for zone in camera_zones
     ]
-    max_x = max(point[0] for zone in scaled_zone_data for point in zone["polygon"])
-    max_y = max(point[1] for zone in scaled_zone_data for point in zone["polygon"])
-    fit_scale = min(1.0, (frame_width - 1) / max_x, (frame_height - 1) / max_y)
+    max_x = max((point[0] for zone in scaled_zone_data for point in zone["polygon"]), default=0)
+    max_y = max((point[1] for zone in scaled_zone_data for point in zone["polygon"]), default=0)
+    fit_scale = min(1.0, (frame_width - 1) / max_x, (frame_height - 1) / max_y) if scaled_zone_data else 1.0
     if fit_scale < 1.0:
         for zone in scaled_zone_data:
             zone["polygon"] = [[round(x * fit_scale), round(y * fit_scale)] for x, y in zone["polygon"]]
@@ -442,7 +476,10 @@ def _analyze_camera(
 
     def progress(done: int, total: int) -> None:
         with update_lock:
-            job["camera_progress"][camera_id] = round(done / total * 100) if total else 100
+            if total:
+                job["camera_progress"][camera_id] = min(99, round(done / total * 100))
+            else:
+                job["camera_progress"][camera_id] = min(99, int(job["camera_progress"].get(camera_id, 0)))
             job["progress_percent"] = round(sum(job["camera_progress"].values()) / len(CAMERAS))
             job["frames_processed_by_camera"] = {
                 **job.get("frames_processed_by_camera", {}), camera_id: done,
@@ -452,14 +489,18 @@ def _analyze_camera(
         metrics.update({
             "camera_id": camera_id,
             "roi_configuration_valid": valid_zone_configuration(camera_id, camera_zones),
-            "vehicle_track_count": sum(int(value) for value in metrics.get("vehicle_category_tracks", {}).values()),
+            "vehicle_track_count": int(metrics.get("relevant_vehicle_track_count", 0)),
             "source_mode": "recorded",
             "updated_at_epoch": time.time(),
         })
         with update_lock:
             job["provisional_camera_metrics"][camera_id] = metrics
             now = time.monotonic()
-            conflict_seen = metrics.get("pedestrian_in_free_left_route_now") is True or metrics.get("pedestrian_vehicle_overlap_now") is True
+            conflict_seen = (
+                metrics.get("pedestrian_in_free_left_route_now") is True
+                or metrics.get("pedestrian_vehicle_overlap_now") is True
+                or metrics.get("turn_path_blocked_now") is True
+            )
             if conflict_seen or now - job.get("_last_decision_update_monotonic", 0.0) >= 0.2:
                 _publish_job_decision(job, recommend(
                     list(job["provisional_camera_metrics"].values()),
@@ -484,7 +525,11 @@ def _analyze_camera(
                 job["message"] = f"Analyzing {active_count}/{len(CAMERAS)} camera streams"
 
     model_load_started = time.perf_counter()
-    detector = UltralyticsByteTrackDetector(image_size=image_size, device=device)
+    detector = UltralyticsByteTrackDetector(
+        image_size=image_size,
+        device=device,
+        classes=None if camera_id == "turning" else TRAFFIC_CLASS_IDS,
+    )
     model_load_seconds = round(time.perf_counter() - model_load_started, 2)
     with update_lock:
         job["camera_model_load_seconds"][camera_id] = model_load_seconds
@@ -517,6 +562,9 @@ def _analyze_camera(
     summary["model_load_seconds"] = model_load_seconds
     summary["roi_configuration_valid"] = valid_zone_configuration(camera_id, camera_zones)
     summary["configured_zone_kinds"] = sorted({str(zone.get("kind", "")) for zone in camera_zones})
+    with update_lock:
+        job["camera_progress"][camera_id] = 100
+        job["progress_percent"] = round(sum(job["camera_progress"].values()) / len(CAMERAS))
     return camera_index, summary
 
 
@@ -584,7 +632,7 @@ def _run_job(job_id: str, input_dir: Path, paths: list[Path], performance_profil
             torch.backends.cudnn.benchmark = True
         if performance_profile == "fast":
             frame_stride = 1
-            image_sizes = {camera: (512 if camera == "turning" else 416) if device == "0" else 256 for camera in CAMERAS}
+            image_sizes = {camera: (512 if camera == "turning" else 416) if device == "0" else 416 for camera in CAMERAS}
         else:
             frame_stride = 1 if device == "0" else 2
             image_sizes = {
@@ -606,20 +654,45 @@ def _run_job(job_id: str, input_dir: Path, paths: list[Path], performance_profil
             _finalize_early_stopped_job(job_id, job, output_dir, site_label, performance_profile, "Analysis stopped before any video frames were processed.")
             return
         summaries: list[dict[str, Any] | None] = [None] * len(CAMERAS)
+        camera_errors: dict[str, str] = {}
         update_lock: threading.Lock = job["_update_lock"]
         with ThreadPoolExecutor(max_workers=3, thread_name_prefix="traffic-camera") as executor:
-            futures = [
-                executor.submit(_analyze_camera, job_id, index, camera_id, source_path, output_dir, config, update_lock, device, frame_stride, image_sizes[camera_id], stop_event, decision_thresholds, history_context)
+            futures = {
+                executor.submit(_analyze_camera, job_id, index, camera_id, source_path, output_dir, config, update_lock, device, frame_stride, image_sizes[camera_id], stop_event, decision_thresholds, history_context): (index, camera_id)
                 for index, (camera_id, source_path) in enumerate(zip(CAMERAS, paths))
-            ]
+            }
             for future in as_completed(futures):
-                index, summary = future.result()
-                summaries[index] = summary
+                index, camera_id = futures[future]
+                try:
+                    _, summary = future.result()
+                    summaries[index] = summary
+                except Exception as error:
+                    LOGGER.exception("Recorded camera %s failed in session %s", camera_id, job_id)
+                    camera_errors[camera_id] = str(error)
+                    summaries[index] = {
+                        "camera_id": camera_id,
+                        "display_name": {"approach": "Road 1 · main approach / free-left", "turning": "Road 2 · free-left / pedestrian conflict", "exit": "Road 3 · right-side joining road"}[camera_id],
+                        "status": "error",
+                        "error": str(error),
+                        "frame_count_processed": 0,
+                        "frame_coverage_percent": 0,
+                    }
+                    job.setdefault("camera_states", {})[camera_id] = "error"
+                    job.setdefault("camera_errors", {})[camera_id] = str(error)
 
         camera_summaries = [summary for summary in summaries if summary is not None]
-        for item in camera_summaries:
-            item["vehicle_track_count"] = sum(int(v) for v in item.get("vehicle_category_tracks", {}).values())
-        cross_camera = associate_camera_tracks(camera_summaries)
+        valid_camera_summaries = [item for item in camera_summaries if item.get("status") != "error"]
+        camera_warnings = {
+            str(item["camera_id"]): list(item.get("input_warnings", []))
+            for item in valid_camera_summaries if item.get("input_warnings")
+        }
+        incomplete_coverage = any(
+            item.get("frame_coverage_percent") is not None and item.get("frame_coverage_percent") < 100
+            for item in valid_camera_summaries
+        )
+        for item in valid_camera_summaries:
+            item["vehicle_track_count"] = int(item.get("relevant_vehicle_track_count", 0))
+        cross_camera = associate_camera_tracks(valid_camera_summaries)
         decision = recommend(camera_summaries, decision_thresholds, history_context, cross_camera)
         _publish_job_decision(job, decision)
         result = {
@@ -627,21 +700,25 @@ def _run_job(job_id: str, input_dir: Path, paths: list[Path], performance_profil
             "performance_profile": performance_profile,
             "site_label": site_label,
             "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "camera_count": len(camera_summaries),
-            "data_status": "partial" if stop_event.is_set() else "complete" if all(item["frame_coverage_percent"] == 100 for item in camera_summaries) else "partial",
+            "camera_count": len(valid_camera_summaries),
+            "data_status": "partial" if stop_event.is_set() or camera_errors or incomplete_coverage or camera_warnings else "complete",
             "camera_results": camera_summaries,
             "cross_camera_identity": cross_camera,
             "historical_context": history_context,
             "junction_decision": decision,
             "decision_timing": dict(job.get("decision_timing", {})),
             "decision_timeline": list(job.get("decision_timeline", [])),
-            "limitations": ["Cross-camera matches are conservative appearance matches, not ground-truth identities; synchronized clips are required and uncertain matches remain separate.", "Queue extent is image-plane pixels; physical length and calibrated speed require a road-plane calibration and stop-line location.", "Example camera zones must be calibrated to actual road views; the advisory does not operate a traffic signal."],
+            "camera_errors": camera_errors,
+            "camera_warnings": camera_warnings,
+            "limitations": ["A failed or unreadable clip is reported per camera and causes an insufficient-data junction decision; remaining camera analyses and the partial PDF are retained.", "Cross-camera matches are conservative appearance matches, not ground-truth identities; synchronized clips are required and uncertain matches remain separate.", "Queue extent is image-plane pixels; physical length and calibrated speed require a road-plane calibration and stop-line location.", "Example camera zones must be calibrated to actual road views; the advisory does not operate a traffic signal."],
         }
         generate_session_pdf(result, output_dir / "session_report.pdf")
         result["report_url"] = f"/api/v1/analysis/{job_id}/report.pdf"
         (output_dir / "session_summary.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
-        final_status = "stopped" if stop_event.is_set() else "complete"
-        job.update(status=final_status, message="Analysis stopped; partial evidence is shown." if stop_event.is_set() else "Analysis complete", progress_percent=round(sum(job.get("camera_progress", {}).values()) / len(CAMERAS)), result=result, junction_decision=decision, decision=decision)
+        final_status = "stopped" if stop_event.is_set() else "partial" if camera_errors or incomplete_coverage or camera_warnings else "complete"
+        partial_reasons = len(camera_errors) + len(camera_warnings)
+        message = "Analysis stopped; partial evidence is shown." if stop_event.is_set() else f"Partial analysis: {partial_reasons} camera clip(s) had input or decoding issues; a report is ready." if final_status == "partial" else "Analysis complete"
+        job.update(status=final_status, message=message, progress_percent=round(sum(job.get("camera_progress", {}).values()) / len(CAMERAS)), result=result, junction_decision=decision, decision=decision)
     except Exception as error:
         LOGGER.exception("Recorded analysis job %s failed", job_id)
         job.update(status="stopped" if stop_event.is_set() else "failed", message="Analysis stopped." if stop_event.is_set() else "Analysis failed", error=str(error))
@@ -675,9 +752,9 @@ def _run_live_job(job_id: str, device_map: dict[str, int | str], performance_pro
         if device != "cpu":
             torch.backends.cudnn.benchmark = True
         if performance_profile == "fast":
-            image_size = 416 if device == "0" else 256
-        else:
             image_size = 512 if device == "0" else 416
+        else:
+            image_size = 640 if device == "0" else 512
     except Exception as error:
         LOGGER.exception("Could not initialize live analysis settings")
         stop_event.set()
@@ -733,19 +810,20 @@ def _run_live_job(job_id: str, device_map: dict[str, int | str], performance_pro
                 job["live_identity"] = identity_summary
                 active_metrics = [job["live_metrics_by_camera"][cam] for cam in CAMERAS if cam in job["live_metrics_by_camera"]]
                 now = time.monotonic()
-                conflict_seen = metrics.get("pedestrian_in_free_left_route_now") is True or metrics.get("pedestrian_vehicle_overlap_now") is True
+                conflict_seen = (
+                    metrics.get("pedestrian_in_free_left_route_now") is True
+                    or metrics.get("pedestrian_vehicle_overlap_now") is True
+                    or metrics.get("turn_path_blocked_now") is True
+                )
                 if conflict_seen or now - job.get("_last_decision_update_monotonic", 0.0) >= 0.2:
                     _publish_job_decision(job, recommend(active_metrics, decision_thresholds, history_context, identity_summary), now)
                     job["_last_decision_update_monotonic"] = now
             identity_summary = job.get("live_identity", {})
-            counts["estimated_unique_vehicles"] = identity_summary["estimated_unique_vehicles"]
-            counts["ambiguous_candidate_pairs"] = identity_summary["ambiguous_candidate_pairs"]
             capture_fps = counts.get("source_fps", 0)
             capture_fps_text = f"{capture_fps:.1f}" if isinstance(capture_fps, (int, float)) and capture_fps > 0 else "—"
             frame = _draw_performance_hud(cv2, frame, [
                 f"ANALYSIS {counts.get('inference_fps', 0):.1f} FPS  |  CAPTURE {capture_fps_text} FPS",
                 f"FRAME AGE {counts.get('frame_age_ms', '—')} ms  |  DROPPED {counts.get('dropped_capture_frames', 0)}",
-                f"UNIQUE ~{identity_summary['estimated_unique_vehicles']}  |  AMBIGUOUS {identity_summary['ambiguous_candidate_pairs']}",
             ])
             encoded, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
             if not encoded:

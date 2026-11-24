@@ -28,33 +28,35 @@ def generate_session_pdf(session: dict[str, Any], output_path: Path) -> Path:
         Paragraph(f"Site: {escape(_pdf_safe(session.get('site_label', 'not recorded')))} | Mode: {escape(_pdf_safe(session.get('session_mode', 'unknown')))} | Generated: {escape(_pdf_safe(session.get('generated_at', 'not recorded')))}", styles["BodyText"]),
         Paragraph(f"Data coverage: {escape(str(session.get('data_status', 'unknown')))} | Cameras analyzed: {escape(str(session.get('camera_count', 'unknown')))}", styles["BodyText"]),
         Spacer(1, 8),
-        Paragraph("This report summarizes recorded analysis output. Camera-local track IDs do not establish global identity; camera counts may include the same vehicle in more than one view.", styles["SmallNote"]),
+        Paragraph("Counts are confirmed camera-local tracks after a two-frame minimum. Camera 1 counts vehicles entering its free-left polygon; camera 3 counts the full joining-road view. The same physical vehicle may appear in both views, so these role counts are not added into a junction-wide vehicle total.", styles["SmallNote"]),
         Spacer(1, 10),
         Paragraph("Camera results", styles["Heading2"]),
     ]
-    rows = [["Camera", "Frames", "Coverage", "Vehicle tracks*", "Queue area", "Max queue", "Avg wait", "Blocked s", "Blockage %"]]
-    categories: dict[str, int] = {}
-    total_camera_vehicle_tracks = 0
+    rows = [["Camera", "Frames", "Coverage", "Relevant vehicle tracks", "Scope", "Max occupancy", "Avg wait", "Blocked s", "Blockage %"]]
+    category_rows = [["Camera role", "Category", "Confirmed relevant tracks"]]
     for camera in session.get("camera_results", []):
-        camera_categories = camera.get("vehicle_category_tracks", {})
-        vehicle_tracks = sum(int(value) for value in camera_categories.values())
+        camera_categories = camera.get("relevant_vehicle_category_tracks", camera.get("vehicle_category_tracks", {}))
+        vehicle_tracks = int(camera.get("relevant_vehicle_track_count", camera.get("vehicle_track_count", sum(int(value) for value in camera_categories.values()))))
         zone_tracks = camera.get("zone_vehicle_tracks", {})
-        approach_roi_tracks = zone_tracks.get("queue_area", "—")
-        total_camera_vehicle_tracks += vehicle_tracks
-        for name, count in camera_categories.items():
-            categories[name] = categories.get(name, 0) + int(count)
+        camera_id = str(camera.get("camera_id", "unknown"))
+        if camera_id == "approach":
+            scope = f"Main lane {camera.get('approach_lane_vehicle_track_count', 0)} · free-left {zone_tracks.get('free_left_lane', vehicle_tracks)} tracks"
+        elif camera_id == "turning":
+            scope = f"Full-frame turn path · blocked frames {camera.get('turn_path_obstruction_frames', 0)}; max blockage {camera.get('turn_path_max_obstruction_count', 0)}"
+        else:
+            scope = f"Full-frame joining road · max moving {camera.get('joining_flow_max_moving_vehicles', 0)} / stopped {camera.get('joining_flow_max_stationary_vehicles', 0)}"
         rows.append([
-            str(camera.get("camera_id", "unknown")),
+            camera_id,
             _display(camera.get("frame_count_processed")),
             _display(camera.get("frame_coverage_percent"), "%"),
             str(vehicle_tracks),
-            _pdf_safe(approach_roi_tracks),
+            Paragraph(escape(_pdf_safe(scope)), styles["SmallNote"]),
             _display(camera.get("maximum_queue_vehicles")),
             _display(camera.get("average_wait_seconds"), " s"),
             _display(camera.get("total_blocked_seconds"), " s"),
             _display(camera.get("blockage_ratio_percent"), "%"),
         ])
-    camera_table = Table(rows, repeatRows=1, colWidths=[19 * mm, 13 * mm, 16 * mm, 21 * mm, 17 * mm, 14 * mm, 17 * mm, 17 * mm, 17 * mm])
+    camera_table = Table(rows, repeatRows=1, colWidths=[15 * mm, 12 * mm, 13 * mm, 23 * mm, 42 * mm, 13 * mm, 16 * mm, 15 * mm, 15 * mm])
     camera_table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#16324f")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
@@ -68,36 +70,67 @@ def generate_session_pdf(session: dict[str, Any], output_path: Path) -> Path:
         ("TOPPADDING", (0, 0), (-1, -1), 5),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
     ]))
-    story.extend([camera_table, Spacer(1, 7), Paragraph(f"* Vehicle tracks observed by cameras, not deduplicated junction-wide. Combined camera observations: {total_camera_vehicle_tracks}.", styles["SmallNote"]), Spacer(1, 8)])
+    story.extend([camera_table, Spacer(1, 8)])
 
-    story.append(Paragraph("Vehicle category distribution", styles["Heading2"]))
-    category_rows = [["Category", "Camera-local tracks"]] + [[name, str(count)] for name, count in sorted(categories.items())]
-    if not categories:
-        category_rows.append(["No category measurements available", "-"])
-    category_table = Table(category_rows, colWidths=[60 * mm, 45 * mm])
+    camera_errors = session.get("camera_errors")
+    camera_warnings = session.get("camera_warnings")
+    if (isinstance(camera_errors, dict) and camera_errors) or (isinstance(camera_warnings, dict) and camera_warnings):
+        story.append(Paragraph("Camera input notes", styles["Heading3"]))
+    if isinstance(camera_errors, dict):
+        for camera_id, message in sorted(camera_errors.items()):
+            story.append(Paragraph(f"{escape(_pdf_safe(camera_id))} error: {escape(_pdf_safe(message))}", styles["SmallNote"]))
+    if isinstance(camera_warnings, dict):
+        for camera_id, messages in sorted(camera_warnings.items()):
+            for message in messages:
+                story.append(Paragraph(f"{escape(_pdf_safe(camera_id))}: {escape(_pdf_safe(message))}", styles["SmallNote"]))
+    if (isinstance(camera_errors, dict) and camera_errors) or (isinstance(camera_warnings, dict) and camera_warnings):
+        story.append(Spacer(1, 6))
+
+    story.append(Paragraph("Vehicle category counts by relevant camera view", styles["Heading2"]))
+    for camera in session.get("camera_results", []):
+        cats = camera.get("relevant_vehicle_category_tracks", camera.get("vehicle_category_tracks", {}))
+        role = str(camera.get("display_name", camera.get("camera_id", "camera")))
+        if cats:
+            category_rows.extend([[role, name, str(count)] for name, count in sorted(cats.items())])
+    if len(category_rows) == 1:
+        category_rows.append(["No confirmed relevant tracks", "—", "0"])
+    category_table = Table(category_rows, colWidths=[72 * mm, 43 * mm, 45 * mm])
     category_table.setStyle(_simple_table_style(colors))
     story.extend([category_table, Spacer(1, 8)])
 
     story.append(Paragraph("Vehicle observations by camera region", styles["Heading2"]))
-    zone_rows = [["Camera", "Vehicle tracks", "Tracks observed in configured zones"]]
+    zone_rows = [["Camera", "Relevant confirmed tracks", "Counting / safety scope"]]
     for camera in session.get("camera_results", []):
         zone_tracks = camera.get("zone_vehicle_tracks", {})
-        zone_text = "; ".join(f"{name}: {count}" for name, count in sorted(zone_tracks.items())) or "No region counts recorded"
+        camera_id = str(camera.get("camera_id", "unknown"))
+        if camera_id == "approach":
+            zone_text = (
+                f"Main-lane polygon: {camera.get('approach_lane_vehicle_track_count', 0)} confirmed tracks; "
+                f"free-left subregion: {zone_tracks.get('free_left_lane', 0)} confirmed tracks. "
+                f"Current queue span {camera.get('current_queue_extent_pixels', 0)} px; maximum observed span "
+                f"{camera.get('maximum_queue_extent_pixels', 0)} px; stopped delay {camera.get('total_stopped_delay_seconds', 0)} s. "
+                f"P95 span ratio against the free-left ROI diagonal: {camera.get('p95_queue_length_ratio', 0)}. "
+                "Pixel spans are image-space estimates, not physical distances."
+            )
+        elif camera_id == "turning":
+            zone_text = (
+                f"No polygon. Pedestrians block immediately; moving vehicles may clear; vehicles count as obstruction "
+                f"after remaining stopped for the configured interval. Blocked in {camera.get('turn_path_obstruction_frames', 0)} frames."
+            )
+        else:
+            zone_text = "No polygon. The full frame is used for joining-road vehicle counts and movement classification."
         zone_rows.append([
             _pdf_safe(camera.get("display_name", camera.get("camera_id", "unknown"))),
-            str(camera.get("vehicle_track_count", sum(int(value) for value in camera.get("vehicle_category_tracks", {}).values()))),
+            str(camera.get("relevant_vehicle_track_count", camera.get("vehicle_track_count", 0))),
             Paragraph(escape(zone_text), styles["SmallNote"]),
         ])
     zone_table = Table(zone_rows, repeatRows=1, colWidths=[48 * mm, 28 * mm, 94 * mm])
     zone_table.setStyle(_simple_table_style(colors))
-    identity = session.get("cross_camera_identity", {})
-    estimated_unique = identity.get("estimated_unique_vehicles", identity.get("unique_vehicle_count_estimate_after_confirmed_merges"))
-    upper_bound = identity.get("unique_vehicle_count_upper_bound")
     story.extend([
         zone_table,
         Spacer(1, 4),
         Paragraph(
-            f"Estimated junction-wide unique vehicles after conservative cross-camera matching: {_display(estimated_unique)}; observed-track upper bound: {_display(upper_bound)}. Zone values are camera-local tracks seen in each polygon, not a calibrated line-crossing count; the same physical vehicle may appear in multiple cameras.",
+            "Camera counts stay separate by role. Do not add camera 1 and camera 3 counts to estimate a unique junction vehicle total; camera-to-camera identity matching is not reliable enough to claim that value.",
             styles["SmallNote"],
         ),
         Spacer(1, 8),
@@ -144,7 +177,7 @@ def generate_session_pdf(session: dict[str, Any], output_path: Path) -> Path:
         Paragraph(f"Recommendation: {escape(str(decision.get('recommended_action', 'not available')))}", styles["BodyText"]),
         Paragraph(f"Rule: {escape(str(decision.get('triggered_rule', 'not available')))}", styles["BodyText"]),
         Paragraph(f"Explanation: {escape(_pdf_safe(decision.get('reason', 'No explanation recorded.')))}", styles["BodyText"]),
-        Paragraph(f"Risk score: {escape('Not scored (pedestrian safety override)' if decision.get('risk_score') is None and decision.get('triggered_rule') in {'person_in_free_left_path', 'pedestrian_vehicle_conflict'} else str(decision.get('risk_score', 'not available')))} / 100 | Confidence: {escape(str(decision.get('confidence', 'not available')))}", styles["BodyText"]),
+        Paragraph(f"Risk score: {escape('Not scored (path safety override)' if decision.get('risk_score') is None and decision.get('triggered_rule') in {'person_in_free_left_path', 'pedestrian_vehicle_conflict', 'blocked_turn_path'} else str(decision.get('risk_score', 'not available')))} / 100 | Confidence: {escape(str(decision.get('confidence', 'not available')))}", styles["BodyText"]),
         Spacer(1, 8),
     ])
     joining_flow = (decision.get("input_metrics") or {}).get("joining_road_flow") or {}

@@ -8,8 +8,8 @@ from urllib.parse import urlparse
 from typing import Any, Callable
 
 from vision_engine.camera.video_analysis import _draw_overlay
-from vision_engine.detection.yolo import Detector, UltralyticsByteTrackDetector
-from vision_engine.metrics.traffic import TrafficAnalyzer, VEHICLE_CLASSES
+from vision_engine.detection.yolo import Detector, TRAFFIC_CLASS_IDS, UltralyticsByteTrackDetector
+from vision_engine.metrics.traffic import TrafficAnalyzer, VEHICLE_CLASSES, is_rider_detection
 from vision_engine.roi.zones import Zone, zones_from_mapping
 
 TARGET_FPS = 30
@@ -161,7 +161,11 @@ def run_live_camera(
         on_preview(first_frame[0])
         on_state("loading_model", None)
         model_started = time.perf_counter()
-        detector: Detector = UltralyticsByteTrackDetector(image_size=image_size, device=device)
+        detector: Detector = UltralyticsByteTrackDetector(
+            image_size=image_size,
+            device=device,
+            classes=None if camera_id == "turning" else TRAFFIC_CLASS_IDS,
+        )
         model_load_seconds = time.perf_counter() - model_started
 
         frame, _, _ = first_frame
@@ -170,15 +174,16 @@ def run_live_camera(
             raise ValueError("Camera zone reference_resolution must contain two positive dimensions.")
         scale_x, scale_y = width / reference_width, height / reference_height
         raw_zones = config["cameras"][camera_id]
-        if not raw_zones or any(len(zone.get("polygon", [])) < 3 for zone in raw_zones):
-            raise ValueError(f"Camera zone configuration for {camera_id} must contain polygons with at least three points.")
+        raw_zones = [zone for zone in raw_zones if zone.get("kind") in {"approach", "free_left"}] if camera_id == "approach" else []
+        if camera_id == "approach" and (not raw_zones or any(len(zone.get("polygon", [])) < 3 for zone in raw_zones)):
+            raise ValueError("Camera 1 needs a free_left polygon around the turning lane.")
         scaled = [
             {**zone, "polygon": [[round(point[0] * scale_x), round(point[1] * scale_y)] for point in zone["polygon"]]}
             for zone in raw_zones
         ]
-        max_x = max(point[0] for zone in scaled for point in zone["polygon"])
-        max_y = max(point[1] for zone in scaled for point in zone["polygon"])
-        fit_scale = min(1.0, (width - 1) / max(max_x, 1), (height - 1) / max(max_y, 1))
+        max_x = max((point[0] for zone in scaled for point in zone["polygon"]), default=0)
+        max_y = max((point[1] for zone in scaled for point in zone["polygon"]), default=0)
+        fit_scale = min(1.0, (width - 1) / max(max_x, 1), (height - 1) / max(max_y, 1)) if scaled else 1.0
         if fit_scale < 1.0:
             for zone in scaled:
                 zone["polygon"] = [[round(x * fit_scale), round(y * fit_scale)] for x, y in zone["polygon"]]
@@ -224,8 +229,24 @@ def run_live_camera(
             inference_frames += 1
             timestamp_s = max(0.0, captured_at - source_started_at)
             labels = analyzer.update(detections, timestamp_s)
-            vehicle_boxes = [d for d in detections if d.category.lower() in VEHICLE_CLASSES]
-            pedestrians = sum(d.category.lower() == "person" for d in detections)
+            confirmed_vehicle_ids = {
+                track_id for track_id, state in analyzer.states.items()
+                if state.confirmed and state.category in VEHICLE_CLASSES
+            }
+            vehicle_boxes = [
+                detection for detection in detections
+                if detection.category.lower() in VEHICLE_CLASSES
+                and detection.track_id is not None
+                and analyzer.track_aliases.get(detection.track_id, detection.track_id) in confirmed_vehicle_ids
+                and (
+                    camera_id != "approach"
+                    or any(zone.kind == "approach" and zone.contains(detection.footpoint) for zone in zones)
+                )
+            ]
+            pedestrians = sum(
+                d.category.lower() == "person" and not is_rider_detection(d, detections)
+                for d in detections
+            )
             for detection in vehicle_boxes:
                 if detection.track_id is None or timestamp_s - last_feature_sample.get(detection.track_id, -1e9) < 0.5:
                     continue
@@ -253,9 +274,21 @@ def run_live_camera(
             age_ms = max(0.0, (time.perf_counter() - captured_at) * 1000)
             counts = {
                 "vehicles_in_frame": len(vehicle_boxes),
+                "free_left_vehicles_in_frame": sum(
+                    any(zone.kind == "free_left" and zone.contains(detection.footpoint) for zone in zones)
+                    for detection in vehicle_boxes
+                ) if camera_id == "approach" else 0,
                 "pedestrians_in_frame": pedestrians,
+                "turn_path_objects_in_frame": analyzer.metrics.turn_path_object_count_now,
+                "turn_path_stationary_vehicle_count": analyzer.metrics.turn_path_stationary_vehicle_count_now,
                 "pedestrians_in_free_left_route": analyzer.metrics.pedestrian_in_free_left_route_count_now,
-                "vehicle_tracks": sum(analyzer.metrics.category_counts.values()),
+                "vehicle_tracks": analyzer.metrics.relevant_vehicle_track_count if camera_id in {"approach", "exit"} else sum(analyzer.metrics.category_counts.values()),
+                "approach_lane_vehicle_tracks": analyzer.metrics.approach_lane_vehicle_track_count,
+                "free_left_vehicle_tracks": analyzer.metrics.relevant_vehicle_track_count if camera_id == "approach" else 0,
+                "free_left_queue_length_pixels": analyzer.metrics.current_queue_extent_pixels,
+                "maximum_free_left_queue_length_pixels": analyzer.metrics.maximum_queue_extent_pixels,
+                "free_left_stopped_delay_seconds": round(sum(state.stopped_delay_s for state in analyzer.states.values()), 2) if camera_id == "approach" else 0,
+                "inference_frames": inference_frames,
                 "pedestrian_tracks": analyzer.metrics.pedestrian_tracks,
                 "processing_fps": round(inference_frames / elapsed, 2),
                 "inference_fps": round(inference_frames / max(inference_seconds, 0.001), 2),

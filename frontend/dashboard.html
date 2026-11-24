@@ -7,7 +7,7 @@
   <meta name="description" content="Analyze traffic camera views and review explainable junction advisories with site-specific history.">
   <title>Traffic Analysis | Free-Left Monitor</title>
   <link rel="stylesheet" href="css/style.css?v=live-decision-2">
-  <script src="js/app.js?v=live-decision-2" defer></script>
+  <script src="js/app.js?v=recorded-recovery-3" defer></script>
 </head>
 <body class="dashboard">
   <aside class="sidebar" aria-label="Main navigation">
@@ -56,14 +56,14 @@
         </div>
         <div id="liveSourceControls" class="live-source-controls" hidden>
           <div class="live-source-heading"><strong>USB or network cameras</strong><button class="button button-small button-secondary" id="refreshUsbCameras" type="button">Find USB cameras</button></div>
-          <p>Choose a connected USB camera or enter an RTSP/HTTP stream URL for each view. Leave unused views empty.</p>
+          <p>On camera 1, configure a main-approach polygon that excludes the opposite lane and a free-left polygon inside it. Aim camera 2 tightly at the turn path; moving vehicles may pass, while pedestrians or vehicles stopped for several seconds hold red. When scanning USB, the first available devices are assigned automatically. A phone must expose USB webcam/UVC mode to Windows; simply opening its Camera app does not share its video. Otherwise use a phone camera app that provides an RTSP/HTTP stream over Wi-Fi.</p>
           <label>Camera 01 · Main approach / free-left <select id="liveDeviceApproach"><option value="">Not connected</option></select><input id="liveUrlApproach" type="url" placeholder="rtsp://camera-address/stream" autocomplete="off"></label>
           <label>Camera 02 · Free-left turn / pedestrian <select id="liveDeviceTurning"><option value="">Not connected</option></select><input id="liveUrlTurning" type="url" placeholder="rtsp://camera-address/stream" autocomplete="off"></label>
           <label>Camera 03 · Joining road (right-side view) <select id="liveDeviceExit"><option value="">Not connected</option></select><input id="liveUrlExit" type="url" placeholder="rtsp://camera-address/stream" autocomplete="off"></label>
           <small id="liveDeviceStatus" role="status">The full advisory needs all three camera views; a single view can still be previewed and tracked.</small>
           <button class="button button-primary" id="startLiveBtn" type="button">Start live analysis</button>
         </div>
-        <div class="analysis-actions"><label for="performanceProfile">Processing mode <select id="performanceProfile"><option value="fast" selected>Fast · target 30 FPS</option><option value="balanced">Balanced · higher detail</option></select></label><button class="button button-primary" id="analyzeBtn" type="button" disabled>Analyze three clips (0/3)</button><button class="button button-secondary" id="stopAnalysisBtn" type="button" hidden>Stop analysis</button><span id="analysisStatus" role="status" aria-live="polite">0 of 3 camera clips selected. Choose one clip for each camera; analysis starts when you click the button.</span></div>
+        <div class="analysis-actions"><label for="performanceProfile">Processing mode <select id="performanceProfile"><option value="fast">Fast · target 30 FPS</option><option value="balanced" selected>Balanced · higher detail</option></select></label><button class="button button-primary" id="analyzeBtn" type="button" disabled>Analyze three clips (0/3)</button><button class="button button-secondary" id="stopAnalysisBtn" type="button" hidden>Stop analysis</button><span id="analysisStatus" role="status" aria-live="polite">0 of 3 camera clips selected. Choose one clip for each camera; analysis starts when you click the button.</span></div>
         <div class="analysis-progress" id="analysisProgress" hidden><div class="scan-track"><i></i></div><strong id="progressLabel">Preparing analysis…</strong><span id="progressPercent">0%</span></div>
       </article>
 

@@ -1,6 +1,7 @@
 """YOLO object detection, tracking, and the shared detection data type."""
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 
@@ -29,6 +30,7 @@ class TrafficModel(Protocol):
     def track(self, source: object, **kwargs: object) -> list[object]: ...
 
 TRAFFIC_CLASS_IDS = [0, 2, 3, 5, 7]  # person, car, motorcycle, bus, truck (COCO)
+TRAFFIC_TRACKER = str(Path(__file__).with_name("traffic_bytetrack.yaml"))
 
 
 class UltralyticsByteTrackDetector:
@@ -37,11 +39,12 @@ class UltralyticsByteTrackDetector:
     def __init__(
         self,
         weights: str = "yolo11n.pt",
-        tracker: str = "bytetrack.yaml",
-        confidence: float = 0.25,
+        tracker: str = TRAFFIC_TRACKER,
+        confidence: float = 0.35,
         image_size: int = 640,
         device: str | None = None,
         model: TrafficModel | None = None,
+        classes: list[int] | None = TRAFFIC_CLASS_IDS,
     ) -> None:
         if model is None:
             try:
@@ -54,6 +57,7 @@ class UltralyticsByteTrackDetector:
         self.confidence = confidence
         self.image_size = image_size
         self.device = device
+        self.classes = classes
 
     def detect_and_track(self, frame: object) -> list[Detection]:
         """Detect traffic objects and attach stream-local ByteTrack IDs."""
@@ -61,7 +65,7 @@ class UltralyticsByteTrackDetector:
         options: dict[str, Any] = {
             "persist": True,
             "tracker": self.tracker,
-            "classes": TRAFFIC_CLASS_IDS,
+            "classes": self.classes,
             "conf": self.confidence,
             "imgsz": self.image_size,
             "verbose": False,

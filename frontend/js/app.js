@@ -271,17 +271,28 @@
       const cameraState = job.camera_states?.[camera.key];
       const fps = counts?.inference_fps;
       const sequence = job.frame_sequences?.[camera.key] || 0;
+      const cameraError = job.camera_errors?.[camera.key];
+      const cameraWarnings = job.camera_warnings?.[camera.key] || [];
       const speed = fps != null
         ? (counts.frame_age_ms != null
           ? `${Number(fps).toFixed(1)} / 30 FPS · frame ${counts.frame_age_ms} ms old · dropped ${counts.dropped_capture_frames ?? 0}`
           : `${Number(fps).toFixed(1)} / 30 FPS · processed ${counts.processing_fps ?? '—'} FPS · ${counts.realtime_factor ?? '—'}× clip speed`)
         : cameraState === 'error' ? 'Camera error' : cameraState || `${progress}% complete`;
-      $(`#${camera.status}`).textContent = speed;
+      $(`#${camera.status}`).textContent = cameraError
+        ? `Clip error · ${cameraError}`
+        : cameraWarnings.length ? `Clip note · ${cameraWarnings[0]}` : speed;
       const observationElement = document.getElementById(camera.observations);
       if (sequence > 0 && counts?.inference_frames > 0) {
         const routePeople = Number(counts.pedestrians_in_free_left_route || 0);
-        observationElement.textContent = `Vehicles in frame: ${counts.vehicles_in_frame ?? 0} · Pedestrians: ${counts.pedestrians_in_frame ?? 0} · Vehicle tracks: ${counts.vehicle_tracks ?? 0} · People in monitored path: ${routePeople}`;
-      } else if (cameraState === 'error') observationElement.textContent = 'Camera unavailable · check the source address or device connection.';
+        if (camera.key === 'approach') {
+          observationElement.textContent = `Main-lane vehicles now: ${counts.vehicles_in_frame ?? 0} · main-lane tracks: ${counts.approach_lane_vehicle_tracks ?? 0} · free-left now: ${counts.free_left_vehicles_in_frame ?? 0} · free-left tracks: ${counts.free_left_vehicle_tracks ?? 0} · queue span: ${Number(counts.free_left_queue_length_pixels ?? 0).toFixed(0)} px · stopped delay: ${Number(counts.free_left_stopped_delay_seconds ?? 0).toFixed(1)} s`;
+        } else if (camera.key === 'turning') {
+          observationElement.textContent = `Turn path: ${counts.pedestrians_in_frame ?? 0} pedestrians · ${counts.turn_path_stationary_vehicle_count ?? 0} stopped vehicles · ${counts.turn_path_objects_in_frame ?? 0} total objects`;
+        } else {
+          observationElement.textContent = `Vehicles in frame: ${counts.vehicles_in_frame ?? 0} · vehicle tracks: ${counts.vehicle_tracks ?? 0} · People in monitored path: ${routePeople}`;
+        }
+      } else if (cameraState === 'error') observationElement.textContent = cameraError ? `This clip could not be analyzed: ${cameraError}` : 'Camera unavailable · check the source address or device connection.';
+      else if (cameraWarnings.length) observationElement.textContent = `Video input note: ${cameraWarnings.join(' ')}`;
       else if (sequence > 0) observationElement.textContent = 'Camera preview connected · loading the tracking model…';
       else observationElement.textContent = 'Waiting for the camera to connect…';
       if (camera.key === 'exit') {
@@ -343,13 +354,6 @@
     $('#sourceStatus').textContent = result.data_status === 'complete' ? 'ANALYSIS COMPLETE' : 'PARTIAL ANALYSIS';
   }
 
-  function downloadStoppedReport(result) {
-    const reportLink = $('#downloadReportLink');
-    if (!result?.report_url || reportLink.hidden) return false;
-    reportLink.click();
-    return true;
-  }
-
   async function runRecordedAnalysis() {
     const files = inputs.map((id) => document.getElementById(id).files[0]);
     if (files.some((file) => !file)) { notify('Choose one clip for each camera.'); return; }
@@ -395,17 +399,17 @@
       } while (['queued', 'initializing', 'processing', 'stopping'].includes(job.status));
       if (job.status === 'stopped') {
         if (job.result) renderAnalysis(started.job_id, job.result);
-        const reportDownloaded = stopRequested && downloadStoppedReport(job.result);
-        $('#analysisStatus').textContent = reportDownloaded
-          ? 'Analysis stopped. The partial PDF download was requested; the report button is available if needed.'
-          : job.result?.report_error ? `Analysis stopped, but the PDF report could not be created: ${job.result.report_error}`
-            : job.result ? 'Analysis stopped. The signal shows the usable partial evidence; use the report button to download the PDF.'
-              : 'Analysis stopped before usable frames were available, so there is no report to download.';
+        $('#analysisStatus').textContent = job.result?.report_error
+          ? `Analysis stopped, but the PDF report could not be created: ${job.result.report_error}`
+          : job.result?.report_url ? 'Analysis stopped. The PDF report is ready; select Download analysis report when you want it.'
+            : 'Analysis stopped before usable frames were available, so no report is ready.';
         return;
       }
-      if (job.status !== 'complete') throw new Error(job.error || 'Analysis failed.');
+      if (!['complete', 'partial'].includes(job.status)) throw new Error(job.error || 'Analysis failed.');
       renderAnalysis(started.job_id, job.result);
-      $('#analysisStatus').textContent = 'All three camera clips analyzed.';
+      $('#analysisStatus').textContent = job.status === 'partial'
+        ? 'Some camera clips could not be analyzed. The partial results and report are ready to review.'
+        : 'All three camera clips analyzed.';
       await loadHistory();
     } catch (error) {
       if (stopRequested) $('#analysisStatus').textContent = 'Analysis stopped.';
@@ -432,8 +436,8 @@
     try {
       const data = await apiJson('/api/v1/analysis/devices');
       const selects = [$('#liveDeviceApproach'), $('#liveDeviceTurning'), $('#liveDeviceExit')];
+      const previousAssignments = selects.map((select) => select.value);
       selects.forEach((select) => {
-        const previous = select.value;
         select.innerHTML = '<option value="">Not connected</option>';
         (data.devices || []).forEach((device) => {
           const option = document.createElement('option');
@@ -441,11 +445,26 @@
           option.textContent = `USB camera ${device.device_index} · ${device.width}×${device.height}`;
           select.append(option);
         });
-        if ([...select.options].some((option) => option.value === previous)) select.value = previous;
+      });
+      const assigned = new Set();
+      selects.forEach((select, index) => {
+        const previous = previousAssignments[index];
+        if (previous && [...select.options].some((option) => option.value === previous) && !assigned.has(previous)) {
+          select.value = previous;
+          assigned.add(previous);
+        }
+      });
+      selects.forEach((select) => {
+        if (select.value) return;
+        const available = [...select.options].find((option) => option.value && !assigned.has(option.value));
+        if (available) {
+          select.value = available.value;
+          assigned.add(available.value);
+        }
       });
       $('#liveDeviceStatus').textContent = data.devices?.length
-        ? `Found ${data.devices.length} device(s). Assign different cameras to each view; three are required for a full advisory.`
-        : 'No webcam device found. Enable USB webcam mode on the phone, reconnect, then scan again.';
+        ? `Found ${data.devices.length} device(s). The first available cameras were assigned in order; change any assignment if needed, then start live analysis.`
+        : 'No USB webcam is exposed to Windows. Enable the phone’s USB webcam/UVC mode, reconnect, and scan again; opening the phone Camera app alone is not enough. Or enter an RTSP/HTTP stream URL from a phone camera-streaming app.';
     } catch (error) {
       $('#liveDeviceStatus').textContent = error.message;
     } finally {
@@ -506,10 +525,8 @@
         session_mode: 'live_camera'
       };
       renderAnalysis(activeLiveJobId, liveResult);
-      const reportDownloaded = stopRequested && downloadStoppedReport(liveResult);
-      $('#analysisStatus').textContent = reportDownloaded
-        ? 'Live analysis stopped. The session PDF download was requested; the report button is available if needed.'
-        : liveResult.report_error ? `Live analysis stopped, but the PDF report could not be created: ${liveResult.report_error}`
+      $('#analysisStatus').textContent = liveResult.report_error ? `Live analysis stopped, but the PDF report could not be created: ${liveResult.report_error}`
+        : liveResult.report_url ? 'Live analysis stopped. The session PDF is ready; select Download analysis report when you want it.'
           : job.status === 'failed' ? `Live session ended with an input error. ${liveResult.report_url ? 'The partial PDF report is available to download.' : job.message || 'No report is available.'}`
             : job.message || 'Live camera session stopped.';
       await loadHistory();
@@ -563,7 +580,8 @@
     $('#analysisStatus').textContent = 'Stopping analysis…';
     $('#progressLabel').textContent = 'Stopping analysis…';
     if (activeUploadRequest) {
-      activeUploadRequest.abort();
+      $('#analysisStatus').textContent = 'Finishing the video upload, then preparing a partial report…';
+      $('#progressLabel').textContent = 'Finishing upload before stopping';
       return;
     }
     if (!activeAnalysisJobId) return;

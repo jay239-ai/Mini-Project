@@ -2,15 +2,33 @@
 
 import time
 import threading
+import math
 from pathlib import Path
 from typing import Any
 from collections.abc import Callable
 
 from vision_engine.detection.yolo import Detector
-from vision_engine.metrics.traffic import TrafficAnalyzer, VEHICLE_CLASSES
+from vision_engine.metrics.traffic import TrafficAnalyzer, VEHICLE_CLASSES, is_rider_detection
 from vision_engine.roi.zones import Zone
 
 TARGET_FPS = 30
+
+
+def open_video_capture(cv2: Any, source_path: Path) -> Any:
+    """Prefer FFmpeg for uploaded files, then fall back to OpenCV's platform backend."""
+
+    try:
+        capture = cv2.VideoCapture(str(source_path), cv2.CAP_FFMPEG)
+    except (AttributeError, TypeError, cv2.error):
+        capture = cv2.VideoCapture(str(source_path))
+    if capture.isOpened():
+        return capture
+    capture.release()
+    capture = cv2.VideoCapture(str(source_path))
+    if not capture.isOpened():
+        capture.release()
+        raise RuntimeError(f"OpenCV could not open video file: {source_path}")
+    return capture
 
 
 def analyze_video(
@@ -46,15 +64,19 @@ def analyze_video(
         raise ValueError("Frame stride must be at least one")
     if save_annotated_video:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-    capture = cv2.VideoCapture(str(source_path))
-    if not capture.isOpened():
-        raise RuntimeError(f"OpenCV could not open video file: {source_path}")
+    capture = open_video_capture(cv2, source_path)
+    try:
+        capture_backend = capture.getBackendName()
+    except (AttributeError, cv2.error):
+        capture_backend = "unknown"
 
-    fps = float(capture.get(cv2.CAP_PROP_FPS))
-    if fps <= 0:
-        capture.release()
-        raise RuntimeError(f"Video does not report a valid frame rate: {source_path}")
-    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    reported_fps = float(capture.get(cv2.CAP_PROP_FPS))
+    input_warnings: list[str] = []
+    fps = reported_fps if math.isfinite(reported_fps) and reported_fps > 0 else 30.0
+    if fps != reported_fps:
+        input_warnings.append("The clip did not report a usable frame rate; timestamps use a 30 FPS fallback where media timestamps are unavailable.")
+    reported_frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_count = int(reported_frame_count) if math.isfinite(reported_frame_count) and reported_frame_count > 0 else 0
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     if not width or not height:
@@ -97,11 +119,17 @@ def analyze_video(
     first_preview_sent = False
     last_preview_at = 0.0
     last_metrics_at = 0.0
+    last_video_time = 0.0
     try:
         while stop_event is None or not stop_event.is_set():
             ok, frame = capture.read()
             if not ok:
                 break
+            media_position_s = float(capture.get(cv2.CAP_PROP_POS_MSEC)) / 1000.0
+            fallback_position_s = frame_index / fps
+            video_time = media_position_s if math.isfinite(media_position_s) and media_position_s > last_video_time else fallback_position_s
+            video_time = max(last_video_time, video_time)
+            last_video_time = video_time
             final_frame = frame_count > 0 and frame_index == frame_count - 1
             if frame_index % frame_stride != 0 and not final_frame:
                 frame_index += 1
@@ -112,21 +140,36 @@ def analyze_video(
             detections = detector.detect_and_track(frame)
             inference_seconds += time.perf_counter() - inference_started
             inference_frame_count += 1
-            vehicle_boxes = [
-                detection.box
+            labels = analyzer.update(detections, video_time)
+            confirmed_vehicle_ids = {
+                track_id for track_id, state in analyzer.states.items()
+                if state.confirmed and state.category in VEHICLE_CLASSES
+            }
+            vehicle_detections = [
+                detection
                 for detection in detections
                 if detection.category.lower() in VEHICLE_CLASSES
+                and detection.track_id is not None
+                and analyzer.track_aliases.get(detection.track_id, detection.track_id) in confirmed_vehicle_ids
+                and (
+                    camera_id != "approach"
+                    or any(zone.kind == "approach" and zone.contains(detection.footpoint) for zone in zones)
+                )
             ]
-            visible_vehicle_counts.append(len(vehicle_boxes))
+            vehicle_boxes = [detection.box for detection in vehicle_detections]
+            visible_vehicle_counts.append(len(vehicle_detections))
             frame_area = width * height
             vehicle_box_area = sum(
                 max(0.0, x2 - x1) * max(0.0, y2 - y1)
                 for x1, y1, x2, y2 in vehicle_boxes
             )
             vehicle_box_area_percentages.append(vehicle_box_area / frame_area * 100)
-            video_time = frame_index / fps
             for detection in detections:
                 if detection.track_id is None or detection.category.lower() not in VEHICLE_CLASSES:
+                    continue
+                if camera_id == "approach" and not any(
+                    zone.kind == "approach" and zone.contains(detection.footpoint) for zone in zones
+                ):
                     continue
                 if video_time - last_descriptor_time.get(detection.track_id, -1e9) < 0.5:
                     continue
@@ -153,7 +196,6 @@ def analyze_video(
                     item["color_hist"] = [(old * n + new) / (n + 1) for old, new in zip(item["color_hist"], feature)]
                     item["samples"] = n + 1
                     item["end_s"] = video_time + identity_time_offset_s
-            labels = analyzer.update(detections, video_time)
             if writer is not None:
                 annotated = _draw_overlay(cv2, frame.copy(), zones, detections, labels, frame_index, frame_count)
                 writer.write(annotated)
@@ -162,6 +204,7 @@ def analyze_video(
             urgent_pedestrian_event = (
                 analyzer.metrics.pedestrian_in_free_left_route_now
                 or analyzer.metrics.pedestrian_vehicle_overlap_now
+                or analyzer.metrics.turn_path_blocked_now
             )
             if metrics_callback and (
                 now - last_metrics_at >= 0.2
@@ -183,7 +226,10 @@ def analyze_video(
                 metrics_callback(provisional_metrics)
                 last_metrics_at = now
             if preview_callback and (not first_preview_sent or now - last_preview_at >= 1 / TARGET_FPS or frame_index == frame_count):
-                visible_pedestrians = sum(detection.category.lower() == "person" for detection in detections)
+                visible_pedestrians = sum(
+                    detection.category.lower() == "person" and not is_rider_detection(detection, detections)
+                    for detection in detections
+                )
                 vehicles_by_zone = {
                     zone.name: sum(
                         detection.category.lower() in VEHICLE_CLASSES and zone.contains(detection.footpoint)
@@ -194,10 +240,22 @@ def analyze_video(
                 live_annotated = _draw_overlay(cv2, frame.copy(), zones, detections, labels, frame_index, frame_count)
                 elapsed = max(now - frame_started, 0.001)
                 counts = {
-                    "vehicles_in_frame": len(vehicle_boxes),
+                    "vehicles_in_frame": len(vehicle_detections),
+                    "free_left_vehicles_in_frame": sum(
+                        any(zone.kind == "free_left" and zone.contains(detection.footpoint) for zone in zones)
+                        for detection in vehicle_detections
+                    ) if camera_id == "approach" else 0,
                     "pedestrians_in_frame": visible_pedestrians,
+                    "turn_path_objects_in_frame": analyzer.metrics.turn_path_object_count_now,
+                    "turn_path_stationary_vehicle_count": analyzer.metrics.turn_path_stationary_vehicle_count_now,
                     "pedestrians_in_free_left_route": analyzer.metrics.pedestrian_in_free_left_route_count_now,
-                    "vehicle_tracks": sum(analyzer.metrics.category_counts.values()),
+                    "vehicle_tracks": analyzer.metrics.relevant_vehicle_track_count if camera_id in {"approach", "exit"} else sum(analyzer.metrics.category_counts.values()),
+                    "approach_lane_vehicle_tracks": analyzer.metrics.approach_lane_vehicle_track_count,
+                    "free_left_vehicle_tracks": analyzer.metrics.relevant_vehicle_track_count if camera_id == "approach" else 0,
+                    "free_left_queue_length_pixels": analyzer.metrics.current_queue_extent_pixels,
+                    "maximum_free_left_queue_length_pixels": analyzer.metrics.maximum_queue_extent_pixels,
+                    "free_left_stopped_delay_seconds": round(sum(state.stopped_delay_s for state in analyzer.states.values()), 2) if camera_id == "approach" else 0,
+                    "inference_frames": inference_frame_count,
                     "pedestrian_tracks": analyzer.metrics.pedestrian_tracks,
                     "vehicles_by_zone_in_frame": vehicles_by_zone,
                     "vehicle_tracks_by_zone": dict(analyzer.metrics.zone_vehicle_tracks),
@@ -228,8 +286,17 @@ def analyze_video(
         if writer is not None:
             writer.release()
 
+    if frame_index == 0 and stop_event is not None and stop_event.is_set():
+        input_warnings.append("Analysis was stopped before this clip produced a decodable frame.")
+    elif frame_index == 0:
+        raise RuntimeError(f"Video opened but no decodable frames were read: {source_path}")
+    if frame_count > frame_index and not (stop_event is not None and stop_event.is_set()):
+        input_warnings.append(f"Video decoding ended after {frame_index} of {frame_count} reported frames.")
+    elif frame_count > 0 and frame_index > frame_count:
+        input_warnings.append(f"The file reported {frame_count} frames, but {frame_index} frames were decoded; its frame-count metadata is inaccurate.")
+
     elapsed = time.perf_counter() - frame_started
-    clip_duration = frame_index / fps
+    clip_duration = max(last_video_time + 1 / fps, frame_count / fps if frame_count > frame_index else 0.0)
     metrics = analyzer.finish(clip_duration)
     metrics.update(
         {
@@ -237,11 +304,13 @@ def analyze_video(
             "source_file": source_path.name,
             "annotated_file": output_path.name if save_annotated_video else None,
             "input_fps": round(fps, 3),
+            "video_decoder": capture_backend,
+            "input_warnings": input_warnings,
             "frame_count_expected": frame_count,
             "frame_count_processed": frame_index,
             "inference_frame_count": inference_frame_count,
             "inference_stride": frame_stride,
-            "frame_coverage_percent": round(frame_index / frame_count * 100, 2) if frame_count > 0 else None,
+            "frame_coverage_percent": round(min(100.0, frame_index / frame_count * 100), 2) if frame_count > 0 else None,
             "clip_duration_seconds": round(clip_duration, 2),
             "wall_time_seconds": round(elapsed, 2),
             "inference_fps": round(inference_frame_count / inference_seconds, 2) if inference_seconds > 0 else None,
