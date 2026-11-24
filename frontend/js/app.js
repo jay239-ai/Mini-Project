@@ -446,7 +446,10 @@
         (data.devices || []).forEach((device) => {
           const option = document.createElement('option');
           option.value = String(device.device_index);
-          option.textContent = `USB camera ${device.device_index} · ${device.width}×${device.height}`;
+          option.dataset.status = device.status || 'ready';
+          option.textContent = device.status === 'black_frame'
+            ? `USB camera ${device.device_index} · black frames detected`
+            : `USB camera ${device.device_index} · ${device.width}×${device.height}`;
           select.append(option);
         });
       });
@@ -460,14 +463,16 @@
       });
       selects.forEach((select) => {
         if (select.value) return;
-        const available = [...select.options].find((option) => option.value && !assigned.has(option.value));
+        const available = [...select.options].find((option) => option.value && !assigned.has(option.value) && option.dataset.status !== 'black_frame');
         if (available) {
           select.value = available.value;
           assigned.add(available.value);
         }
       });
+      const readyCount = (data.devices || []).filter((device) => device.status !== 'black_frame').length;
+      const blackCount = (data.devices || []).length - readyCount;
       $('#liveDeviceStatus').textContent = data.devices?.length
-        ? `Found ${data.devices.length} device(s). The first available cameras were assigned in order; change any assignment if needed, then start live analysis.`
+        ? `Found ${readyCount} working camera(s)${blackCount ? ` and ${blackCount} device(s) returning black frames` : ''}. Working cameras were assigned first. For a black phone feed, enable USB webcam/UVC mode, close other camera apps, and scan again.`
         : 'No USB webcam is exposed to Windows. Enable the phone’s USB webcam/UVC mode, reconnect, and scan again; opening the phone Camera app alone is not enough. Or enter an RTSP/HTTP stream URL from a phone camera-streaming app.';
     } catch (error) {
       $('#liveDeviceStatus').textContent = error.message;

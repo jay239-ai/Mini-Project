@@ -15,6 +15,55 @@ from vision_engine.roi.zones import Zone, zones_from_mapping
 TARGET_FPS = 30
 
 
+class BlackCameraFeedError(RuntimeError):
+    """Raised when a webcam opens but every tested backend returns black frames."""
+
+
+def _frame_has_image_signal(frame: Any) -> bool:
+    """Reject an all-black startup feed while allowing genuinely dark scenes."""
+
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return False
+    return float(frame.mean()) > 2.0
+
+
+def open_usb_camera(cv2: Any, device_index: int) -> tuple[Any, int]:
+    """Try Windows capture backends until one returns actual image content.
+
+    Some phone webcam drivers report an opened DirectShow device but return
+    black frames, while Media Foundation can provide the usable feed.
+    """
+
+    opened = False
+    black_feed = False
+    backends = (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY)
+    for backend in backends:
+        capture = cv2.VideoCapture(device_index, backend)
+        if not capture.isOpened():
+            capture.release()
+            continue
+        opened = True
+        saw_frame = False
+        for _ in range(6):
+            ok, frame = capture.read()
+            if ok and frame is not None:
+                saw_frame = True
+                if _frame_has_image_signal(frame):
+                    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    return capture, backend
+        if saw_frame:
+            black_feed = True
+        capture.release()
+    if black_feed:
+        raise BlackCameraFeedError(
+            f"Camera {device_index} opens but returns only black frames. Enable the phone's USB webcam/UVC mode, close other camera apps, then scan and retry."
+        )
+    detail = "opened but did not return readable frames" if opened else "could not be opened"
+    raise RuntimeError(
+        f"USB camera {device_index} {detail}. Check Windows camera permission, the USB webcam mode, and whether another app is using it."
+    )
+
+
 class LatestFrameSource:
     """Continuously drain a webcam and retain only its newest frame."""
 
@@ -40,22 +89,16 @@ class LatestFrameSource:
                 self.capture.release()
                 self.capture = cv2.VideoCapture(device_index)
         else:
-            self.capture = cv2.VideoCapture(device_index, cv2.CAP_DSHOW)
-        if not self.capture.isOpened() and isinstance(device_index, int):
+            self.capture, self.backend = open_usb_camera(cv2, device_index)
+        if isinstance(device_index, str) and not self.capture.isOpened():
             self.capture.release()
-            self.capture = cv2.VideoCapture(device_index, cv2.CAP_MSMF)
-        if not self.capture.isOpened() and isinstance(device_index, int):
-            self.capture.release()
-            self.capture = cv2.VideoCapture(device_index)
-        if not self.capture.isOpened():
-            self.capture.release()
-            source_kind = "network stream" if isinstance(device_index, str) else f"local camera device {device_index}"
-            raise RuntimeError(f"Could not open {source_kind}. Check the address, availability, and camera credentials.")
+            raise RuntimeError("Could not open network camera stream. Check the address, availability, and camera credentials.")
         self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         self.capture.set(cv2.CAP_PROP_FPS, TARGET_FPS)
         self.lock = threading.Lock()
+        self._close_event = threading.Event()
         self.latest: tuple[Any, int, float] | None = None
         self.error: str | None = None
         self.sequence = 0
@@ -65,7 +108,7 @@ class LatestFrameSource:
 
     def _read_loop(self) -> None:
         failures = 0
-        while not self.stop_event.is_set():
+        while not self.stop_event.is_set() and not self._close_event.is_set():
             try:
                 ok, frame = self.capture.read()
             except Exception as error:
@@ -91,32 +134,30 @@ class LatestFrameSource:
             return self.latest
 
     def close(self) -> None:
-        self.stop_event.set()
+        # This source shares the session event with sibling cameras. Closing a
+        # single failed source must not stop the other active camera feeds.
+        self._close_event.set()
         self.thread.join(timeout=1.0)
         self.capture.release()
 
 
-def enumerate_usb_cameras(max_devices: int = 8) -> list[dict[str, int]]:
-    """Probe local Windows camera indices and return only devices that yield a frame."""
+def enumerate_usb_cameras(max_devices: int = 8) -> list[dict[str, int | str]]:
+    """Probe local camera indices and report devices that are ready or black."""
 
     import cv2
 
-    found: list[dict[str, int]] = []
+    found: list[dict[str, int | str]] = []
     for device_index in range(max_devices):
-        for backend in (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY):
-            capture = cv2.VideoCapture(device_index, backend)
-            if not capture.isOpened():
-                capture.release()
-                continue
-            try:
-                capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                ok, frame = capture.read()
-                if ok and frame is not None:
-                    height, width = frame.shape[:2]
-                    found.append({"device_index": device_index, "width": int(width), "height": int(height)})
-                    break
-            finally:
-                capture.release()
+        try:
+            capture, backend = open_usb_camera(cv2, device_index)
+            width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            capture.release()
+            found.append({"device_index": device_index, "width": width, "height": height, "status": "ready", "backend": int(backend)})
+        except BlackCameraFeedError:
+            found.append({"device_index": device_index, "width": 0, "height": 0, "status": "black_frame"})
+        except RuntimeError:
+            continue
     return found
 
 

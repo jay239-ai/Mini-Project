@@ -348,6 +348,7 @@ async def start_live_analysis(
         "camera_count": len(device_map),
         "camera_sources": {camera: ("network_stream" if isinstance(source, str) else "usb_camera") for camera, source in device_map.items()},
         "active_cameras": list(device_map),
+        "camera_errors": {},
         "camera_states": {camera: "connecting" if camera in device_map else "not_connected" for camera in CAMERAS},
         "camera_progress": {camera: 0 for camera in CAMERAS},
         "live_counts_by_camera": {camera: {"vehicles_in_frame": 0, "pedestrians_in_frame": 0, "vehicle_tracks": 0, "pedestrian_tracks": 0} for camera in CAMERAS},
@@ -889,8 +890,8 @@ def _run_live_job(job_id: str, device_map: dict[str, int | str], performance_pro
                 except Exception as error:
                     LOGGER.exception("Live camera %s failed in session %s", camera_id, job_id)
                     errors.append(f"{camera_id}: {error}")
-                    stop_event.set()
                     job["camera_states"][camera_id] = "error"
+                    job.setdefault("camera_errors", {})[camera_id] = str(error)
                     job["error"] = str(error)
     except Exception as error:
         LOGGER.exception("Live analysis session %s failed", job_id)
@@ -911,6 +912,7 @@ def _run_live_job(job_id: str, device_map: dict[str, int | str], performance_pro
             "site_label": site_label,
             "camera_count": len(summaries),
             "data_status": "complete" if len(summaries) == len(CAMERAS) else "partial",
+            "camera_errors": dict(job.get("camera_errors", {})),
             "camera_results": list(summaries.values()),
             "historical_context": history_context,
             "junction_decision": job["junction_decision"],
