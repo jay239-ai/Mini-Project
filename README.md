@@ -25,11 +25,11 @@ A prototype for analyzing three recorded traffic clips or live USB and supported
 
 ## Camera roles and decision behavior
 
-- **Camera 1 — main approach and free-left:** calibrate a main-approach polygon that excludes the opposite lane, then a free-left polygon inside it. The dashboard reports confirmed tracks in the approach lane and free-left region, current free-left occupancy, queue span, and stopped delay. The decision uses free-left occupancy, queue span, stopped delay, and blockage; the general approach-lane count is reported separately.
-- **Camera 2 — conflict path:** the full frame is monitored. A pedestrian triggers red immediately and the clearance hold continues after the view clears. A vehicle may move through without forcing red; it triggers a hold only after remaining stationary for the configured blockage interval. Aim this camera tightly at the turn path. Person detections overlapping a bicycle or motorcycle detection are treated as riders rather than pedestrians.
+- **Camera 1 — main approach and free-left:** calibrate a main-approach polygon that excludes the opposite lane, then a free-left polygon inside it. The dashboard reports confirmed tracks, current free-left queue, queue span, and stopped delay. A busy approach produces red only when camera 3 also sees heavy moving flow.
+- **Camera 2 — conflict path:** drawing a `turn_path` polygon is optional. Use the dashboard preview tool or `config/camera_zones.example.json` to mark the vehicle-accessible area. With a polygon, only pedestrians and stopped vehicles inside it affect the decision; without one, the whole frame is analyzed. Pedestrians in the checked area trigger red immediately; vehicles trigger a hold only after remaining stationary there for the configured blockage interval. Moving vehicles, including ones approaching the camera, do not trigger red just for being visible. Person detections overlapping a bicycle or motorcycle detection are treated as riders rather than pedestrians.
 - **Camera 3 — joining road:** the full frame measures moving and stationary vehicle flow. High moving flow can raise red when the free-left path is also busy. Stationary vehicles alone raise caution because they may be waiting at their own signal.
 
-Camera 1’s sample polygons in `config/camera_zones.example.json` are illustrative and must be adjusted to the actual camera view. This workspace did not include the video clips needed to calibrate the lane boundaries. The full-frame behavior of cameras 2 and 3 depends on aiming them tightly at the relevant paths.
+Camera 1’s sample polygons are illustrative and must be adjusted to the actual camera view. Camera 2’s polygon is optional: without one, pedestrians anywhere in its full frame are treated as a path obstruction. Camera 3 continues to use its full frame.
 
 ## Preview and reports
 

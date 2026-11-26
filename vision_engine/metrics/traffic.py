@@ -46,6 +46,8 @@ class TrafficMetrics:
     zone_entries: Counter[str] = field(default_factory=Counter)
     zone_exits: Counter[str] = field(default_factory=Counter)
     maximum_queue: int = 0
+    current_queue_vehicles: int = 0
+    current_queue_length_ratio: float = 0.0
     queue_samples: list[int] = field(default_factory=list)
     queue_length_ratio_samples: list[float] = field(default_factory=list)
     moving_approach_samples: list[int] = field(default_factory=list)
@@ -60,6 +62,7 @@ class TrafficMetrics:
     pedestrian_in_free_left_route_count_now: int = 0
     pedestrian_vehicle_overlap_now: bool = False
     turn_path_obstruction_count_now: int = 0
+    turn_path_zone_configured: bool = False
     turn_path_blocked_now: bool = False
     turn_path_pedestrian_count_now: int = 0
     turn_path_pedestrian_now: bool = False
@@ -109,6 +112,8 @@ class TrafficMetrics:
             "zone_entries": dict(self.zone_entries),
             "zone_exits": dict(self.zone_exits),
             "maximum_queue_vehicles": self.maximum_queue,
+            "queue_vehicles_now": self.current_queue_vehicles,
+            "queue_length_ratio_now": round(self.current_queue_length_ratio, 3),
             "average_queue_vehicles": round(sum(self.queue_samples) / len(self.queue_samples), 2) if self.queue_samples else None,
             "p95_queue_vehicles": ordered_queues[p95_index] if p95_index is not None else None,
             "p95_queue_length_ratio": round(ordered_queue_ratios[p95_ratio_index], 3) if p95_ratio_index is not None else 0.0,
@@ -134,6 +139,7 @@ class TrafficMetrics:
             "pedestrian_in_free_left_route_count_now": self.pedestrian_in_free_left_route_count_now,
             "pedestrian_vehicle_overlap_now": self.pedestrian_vehicle_overlap_now,
             "turn_path_obstruction_count_now": self.turn_path_obstruction_count_now,
+            "turn_path_zone_configured": self.turn_path_zone_configured,
             "turn_path_blocked_now": self.turn_path_blocked_now,
             "turn_path_pedestrian_count_now": self.turn_path_pedestrian_count_now,
             "turn_path_pedestrian_now": self.turn_path_pedestrian_now,
@@ -179,6 +185,8 @@ class TrafficAnalyzer:
         self.camera_id = camera_id
         self.zones = zones
         self.zone_by_name = {zone.name: zone for zone in zones}
+        self.turn_path_zone_names = {zone.name for zone in zones if zone.kind == "turn_path"}
+        self.metrics = TrafficMetrics(turn_path_zone_configured=bool(self.turn_path_zone_names))
         self.joining_flow_zone_names = {zone.name for zone in zones if zone.kind == "exit"}
         self.stationary_speed_px_s = stationary_speed_px_s
         self.waiting_threshold_s = waiting_threshold_s
@@ -192,7 +200,6 @@ class TrafficAnalyzer:
         self.last_pedestrian_vehicle_conflict_s: float | None = None
         self.states: dict[int, TrackState] = {}
         self.track_aliases: dict[int, int] = {}
-        self.metrics = TrafficMetrics()
         self.open_blockages: dict[int, float] = {}
         self.counted_tracks: set[int] = set()
         self.relevant_track_categories: dict[int, str] = {}
@@ -230,7 +237,15 @@ class TrafficAnalyzer:
             if person.category.lower() == "person" and is_rider_detection(person, detections)
         }
         turn_path_pedestrians = sum(
-            detection.category.lower() == "person" and id(detection) not in rider_detection_ids
+            detection.category.lower() == "person"
+            and id(detection) not in rider_detection_ids
+            and (
+                not self.turn_path_zone_names
+                or any(
+                    zone.name in self.turn_path_zone_names and zone.contains(detection.footpoint)
+                    for zone in self.zones
+                )
+            )
             for detection in detections
         ) if self.camera_id == "turning" else 0
         turn_path_stationary_vehicles = 0
@@ -243,6 +258,9 @@ class TrafficAnalyzer:
         for detection in detections:
             point = detection.footpoint
             object_zones = {zone.name for zone in self.zones if zone.contains(point)}
+            in_turn_path = self.camera_id == "turning" and (
+                not self.turn_path_zone_names or bool(object_zones & self.turn_path_zone_names)
+            )
             raw_category = detection.category.lower()
             if id(detection) in rider_detection_ids:
                 annotations.append("rider on bicycle/motorcycle · not a pedestrian")
@@ -280,9 +298,31 @@ class TrafficAnalyzer:
             else:
                 elapsed = max(0.0, timestamp_s - state.last_seen)
                 if elapsed > 0:
+                    # A long tracker gap cannot prove that the same object
+                    # stayed still throughout the missing observations.
+                    if elapsed > 1.0:
+                        state.last_moving_at = timestamp_s
+                        state.last_speed_px_s = 0.0
                     dx = point[0] - state.last_point[0]
                     dy = point[1] - state.last_point[1]
-                    state.last_speed_px_s = (dx * dx + dy * dy) ** 0.5 / elapsed
+                    # Footpoints can move very little when a vehicle drives
+                    # toward the camera. Include box-center travel and box
+                    # expansion so an approaching vehicle is not mistaken for
+                    # a stopped obstruction.
+                    previous_box = state.last_box
+                    previous_center = ((previous_box[0] + previous_box[2]) / 2, (previous_box[1] + previous_box[3]) / 2)
+                    current_center = ((detection.box[0] + detection.box[2]) / 2, (detection.box[1] + detection.box[3]) / 2)
+                    center_dx = current_center[0] - previous_center[0]
+                    center_dy = current_center[1] - previous_center[1]
+                    previous_size = (previous_box[2] - previous_box[0], previous_box[3] - previous_box[1])
+                    current_size = (detection.box[2] - detection.box[0], detection.box[3] - detection.box[1])
+                    expansion_motion = (((current_size[0] - previous_size[0]) ** 2 + (current_size[1] - previous_size[1]) ** 2) ** 0.5) / 2
+                    apparent_motion = max(
+                        (dx * dx + dy * dy) ** 0.5,
+                        (center_dx * center_dx + center_dy * center_dy) ** 0.5,
+                        expansion_motion,
+                    )
+                    state.last_speed_px_s = apparent_motion / elapsed
                     if state.last_speed_px_s > 0:
                         state.movement_direction = _movement_direction(dx, dy)
                         self.metrics.relative_speed_px_s_samples.append(state.last_speed_px_s)
@@ -356,6 +396,10 @@ class TrafficAnalyzer:
                 self.metrics.relevant_vehicle_track_count = len(self.relevant_track_categories)
 
             state.zones = object_zones
+            if self.turn_path_zone_names and in_turn_path and not (previous_zones & self.turn_path_zone_names):
+                # Only measure a vehicle's dwell time from when it enters the
+                # actual turn path, not from an earlier stop elsewhere.
+                state.last_moving_at = timestamp_s
             occupied_free_left = self.camera_id == "approach" and in_free_left
             is_approach = self.camera_id == "approach" and occupied_free_left
             stationary_for = max(0.0, timestamp_s - state.last_moving_at)
@@ -395,11 +439,15 @@ class TrafficAnalyzer:
                 self.metrics.blocked_seconds += duration
                 self.metrics.blockage_events.append({"camera_id": self.camera_id, "track_id": track_id, "started_at_video_seconds": round(started, 3), "ended_at_video_seconds": round(timestamp_s, 3), "duration_seconds": round(duration, 3), "severity": self._severity(duration)})
             annotation = f"{category} #{track_id}" if state.confirmed else f"{category} #{track_id} confirming"
-            if occupied_free_left and stationary_for >= self.blockage_threshold_s:
+            if in_turn_path and category == "person":
+                annotation += " IN TURN PATH"
+            if in_turn_path and is_vehicle and stationary_for >= self.blockage_threshold_s:
+                annotation += f" BLOCKAGE {stationary_for:.1f}s"
+            elif occupied_free_left and stationary_for >= self.blockage_threshold_s:
                 annotation += f" BLOCKAGE {stationary_for:.1f}s"
             annotations.append(annotation)
 
-            if self.camera_id == "turning" and is_vehicle and state.confirmed and stationary_for >= self.blockage_threshold_s:
+            if in_turn_path and is_vehicle and state.confirmed and stationary_for >= self.blockage_threshold_s:
                 turn_path_stationary_vehicles += 1
 
         turn_path_blocked_vehicles = turn_path_stationary_vehicles
@@ -441,6 +489,7 @@ class TrafficAnalyzer:
             self.metrics.joining_flow_last_unclassified_vehicles = joining_flow_unclassified_vehicles
             self.metrics.joining_flow_last_vehicles = joining_flow_vehicles
         queue_size = moving_approach + stationary_approach if self.camera_id == "approach" else 0
+        self.metrics.current_queue_vehicles = queue_size
         self.metrics.moving_approach_samples.append(moving_approach if self.camera_id == "approach" else 0)
         self.metrics.stationary_approach_samples.append(stationary_approach if self.camera_id == "approach" else 0)
         self.metrics.queue_samples.append(queue_size)
@@ -453,6 +502,7 @@ class TrafficAnalyzer:
             self.metrics.current_queue_extent_pixels = extent
             self.metrics.maximum_queue_extent_pixels = max(self.metrics.maximum_queue_extent_pixels, extent)
         queue_length_ratio = min(1.0, self.metrics.current_queue_extent_pixels / self.free_left_roi_diagonal) if self.free_left_roi_diagonal else 0.0
+        self.metrics.current_queue_length_ratio = queue_length_ratio
         self.metrics.queue_length_ratio_samples.append(queue_length_ratio)
         for track_id in set(self.open_blockages) - visible_states:
             started = self.open_blockages.pop(track_id)

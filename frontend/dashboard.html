@@ -6,8 +6,8 @@
   <meta name="theme-color" content="#101a24">
   <meta name="description" content="Analyze traffic camera views and review explainable junction advisories with site-specific history.">
   <title>Traffic Analysis | Free-Left Monitor</title>
-  <link rel="stylesheet" href="css/style.css?v=live-decision-2">
-  <script src="js/app.js?v=manual-report-slow-motion-1" defer></script>
+  <link rel="stylesheet" href="css/style.css?v=manual-signal-override-1">
+  <script src="js/app.js?v=manual-signal-override-1" defer></script>
 </head>
 <body class="dashboard">
   <aside class="sidebar" aria-label="Main navigation">
@@ -39,8 +39,9 @@
           </article>
           <article class="tracking-camera-card" id="cameraRowTurning">
             <div class="tracking-card-heading"><strong>Camera 02 · Free-left turn / pedestrian</strong><span id="turningCameraStatus">Waiting</span></div>
-            <div class="tracking-image-wrap"><video id="pedestrianPreview" class="tracking-video" controls playsinline hidden aria-label="Turning camera upload preview"></video><img id="turningTrackingFrame" class="tracking-frame" alt="Turning view with vehicle tracking boxes" hidden><span class="tracking-empty">Choose a clip or connect a live camera</span></div>
+            <div class="tracking-image-wrap"><video id="pedestrianPreview" class="tracking-video" controls playsinline hidden aria-label="Turning camera upload preview"></video><img id="turningTrackingFrame" class="tracking-frame" alt="Turning view with vehicle tracking boxes" hidden><canvas id="turnPathCanvas" class="turn-path-canvas" hidden aria-label="Draw the vehicle turn path"></canvas><span class="tracking-empty">Choose a clip or connect a live camera</span></div>
             <div class="tracking-observations" id="turningObservations">Vehicle and pedestrian counts appear while frames are analyzed.</div>
+            <div class="turn-path-calibration" id="turnPathCalibration"><small>Optional: draw a path to ignore pedestrians outside it. Without one, camera 2 checks its full frame.</small><div><button class="button button-small button-secondary" id="drawTurnPathButton" type="button">Draw vehicle path</button><button class="button button-small button-secondary" id="undoTurnPathPoint" type="button" disabled>Undo point</button><button class="button button-small button-primary" id="saveTurnPathButton" type="button" disabled>Save path</button><button class="button button-small button-secondary" id="clearTurnPathButton" type="button" disabled>Clear path</button></div><span id="turnPathCalibrationStatus" role="status" aria-live="polite">Choose the camera 2 clip, pause on a clear frame, then mark the path.</span></div>
           </article>
           <article class="tracking-camera-card" id="cameraRowExit">
             <div class="tracking-card-heading"><strong>Camera 03 · Joining road (right-side view)</strong><span id="exitCameraStatus">Waiting</span></div>
@@ -73,6 +74,16 @@
           <div class="traffic-lamp" id="trafficLamp" data-state="unknown" role="img" aria-label="Traffic condition waiting for camera data"><i class="lamp-red"></i><i class="lamp-yellow"></i><i class="lamp-green"></i></div>
           <div><strong id="trafficStateLabel">WAITING FOR DATA</strong><p id="decisionReason">Start an analysis to see whether current traffic conditions are green, yellow or red.</p><small id="decisionEvidence">This is a traffic-condition advisory, not a command to real signal hardware.</small></div>
         </div>
+        <section class="manual-signal-panel" aria-labelledby="manualSignalTitle">
+          <div><strong id="manualSignalTitle">Manual display override</strong><small>Changes this dashboard lamp only; it does not control a physical traffic signal.</small></div>
+          <div class="manual-signal-controls">
+            <label for="manualSignalColor">Signal color<select id="manualSignalColor"><option value="red">Red</option><option value="yellow">Yellow</option><option value="green">Green</option></select></label>
+            <label for="manualSignalSeconds">Duration (seconds)<input id="manualSignalSeconds" type="number" min="1" max="3600" step="1" value="30" inputmode="numeric"></label>
+            <button class="button button-primary" id="applyManualSignal" type="button">Apply override</button>
+            <button class="button button-secondary" id="returnAutomaticSignal" type="button" disabled>Return to automatic</button>
+          </div>
+          <p id="manualSignalStatus" role="status" aria-live="polite">Automatic recommendation is active.</p>
+        </section>
       </article>
     </section>
 

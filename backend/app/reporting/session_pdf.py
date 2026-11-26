@@ -114,8 +114,9 @@ def generate_session_pdf(session: dict[str, Any], output_path: Path) -> Path:
             )
         elif camera_id == "turning":
             zone_text = (
-                f"No polygon. Pedestrians block immediately; moving vehicles may clear; vehicles count as obstruction "
-                f"after remaining stopped for the configured interval. Blocked in {camera.get('turn_path_obstruction_frames', 0)} frames."
+                f"Scope: {'configured turn-path polygon' if camera.get('turn_path_zone_configured') else 'full frame (no polygon configured)'}. "
+                f"Pedestrians in the checked area block immediately. Vehicles count as obstruction after remaining stopped "
+                f"in the checked area for the configured interval. Blocked in {camera.get('turn_path_obstruction_frames', 0)} frames."
             )
         else:
             zone_text = "No polygon. The full frame is used for joining-road vehicle counts and movement classification."
@@ -241,8 +242,8 @@ def generate_session_pdf(session: dict[str, Any], output_path: Path) -> Path:
             conflict_samples = "not available"
         zone_tracks = camera.get("zone_vehicle_tracks", {})
         nearby_vehicles = zone_tracks.get("vehicle_near_crossing_buffer", "not configured")
-        route_now = camera.get("pedestrian_in_free_left_route_now")
-        route_count = camera.get("pedestrian_in_free_left_route_count_now", 0)
+        route_now = camera.get("turn_path_pedestrian_now", camera.get("pedestrian_in_free_left_route_now"))
+        route_count = camera.get("turn_path_pedestrian_count_now", camera.get("pedestrian_in_free_left_route_count_now", 0))
         route_text = f"yes ({route_count})" if route_now else "no"
         pedestrian_rows.append([
             _pdf_safe(camera.get("display_name", camera.get("camera_id", "camera"))),
@@ -256,7 +257,7 @@ def generate_session_pdf(session: dict[str, Any], output_path: Path) -> Path:
     pedestrian_table.setStyle(_simple_table_style(colors))
     story.append(pedestrian_table)
     story.append(Paragraph(
-        "Person tracks anywhere in a frame are informational. Only a person whose footpoint enters a configured free-left or pedestrian-conflict polygon triggers the route safety rule. A person in the crossing-conflict polygon and a vehicle in that polygon or the optional nearby buffer in the same frame count as a conflict sample. Calibrate both polygons to the real camera view.",
+        "Person tracks outside the checked camera 2 area are informational when a turn_path polygon is configured. With no polygon, the full camera 2 frame is checked. A person in the checked area triggers the pedestrian safety hold; a vehicle must remain stopped there for the configured interval.",
         styles["SmallNote"],
     ))
     for note in session.get("limitations", []):

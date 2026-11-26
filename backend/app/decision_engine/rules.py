@@ -136,8 +136,10 @@ def recommend(
             conflict_samples = _number(item.get("pedestrian_vehicle_overlap_samples", 0), "pedestrian_vehicle_overlap_samples", integer=True)
         except ValueError:
             continue
-        route_pedestrian = role == "approach" and item.get("pedestrian_in_free_left_route_now") is True
-        active_overlap = item.get("pedestrian_vehicle_overlap_now") is True
+        # Camera 1 covers the approach, not the actual crossing path. People
+        # anywhere in that wide view must not hold the free-left signal.
+        route_pedestrian = False
+        active_overlap = role == "turning" and item.get("pedestrian_vehicle_overlap_now") is True
         path_obstructed = role == "turning" and item.get("turn_path_blocked_now") is True
         if path_obstructed or route_pedestrian or active_overlap:
             turn_path_count = int(item.get("turn_path_obstruction_count_now", 0) or 0)
@@ -197,9 +199,12 @@ def recommend(
     if len(by_role) != 3:
         return _empty("insufficient", "Camera roles are incomplete or duplicated.", camera_count=len(by_role), warnings=warnings or ["approach, turning, and exit are required"])
 
-    pedestrian_route_now = any(item.get("pedestrian_in_free_left_route_now") is True for item in by_role.values())
-    pedestrian_route_count_now = max((int(item.get("pedestrian_in_free_left_route_count_now", 0) or 0) for item in by_role.values()), default=0)
-    pedestrian_vehicle_overlap_now = any(item.get("pedestrian_vehicle_overlap_now") is True for item in by_role.values())
+    # Camera 2 uses its calibrated polygon when available, otherwise it safely
+    # falls back to checking the entire frame. Other cameras cannot block.
+    turning_view = by_role["turning"]
+    pedestrian_route_now = turning_view.get("pedestrian_in_free_left_route_now") is True
+    pedestrian_route_count_now = int(turning_view.get("pedestrian_in_free_left_route_count_now", 0) or 0)
+    pedestrian_vehicle_overlap_now = turning_view.get("pedestrian_vehicle_overlap_now") is True
 
     normalized: dict[str, dict[str, float | int]] = {}
     for role in CAMERA_ROLES:
@@ -215,6 +220,8 @@ def recommend(
                 "frames_processed": _number(item["frames_processed"], f"{role}.frames_processed", integer=True),
                 "total_observation_seconds": _number(item["total_observation_seconds"], f"{role}.total_observation_seconds"),
                 "maximum_queue_vehicles": _number(item["maximum_queue_vehicles"], f"{role}.maximum_queue_vehicles", integer=True),
+                "queue_vehicles_now": _number(item.get("queue_vehicles_now", 0), f"{role}.queue_vehicles_now", integer=True),
+                "queue_length_ratio_now": _number(item.get("queue_length_ratio_now", 0), f"{role}.queue_length_ratio_now"),
                 "p95_queue_vehicles": _number(item["p95_queue_vehicles"], f"{role}.p95_queue_vehicles", integer=True),
                 "p95_queue_length_ratio": _number(item["p95_queue_length_ratio"], f"{role}.p95_queue_length_ratio"),
                 "total_stopped_delay_seconds": _number(item["total_stopped_delay_seconds"], f"{role}.total_stopped_delay_seconds"),
@@ -227,6 +234,8 @@ def recommend(
             }
             if values["p95_queue_length_ratio"] > 1:
                 raise ValueError(f"{role}.p95_queue_length_ratio must not exceed 1")
+            if values["queue_length_ratio_now"] > 1:
+                raise ValueError(f"{role}.queue_length_ratio_now must not exceed 1")
             categories = item.get("relevant_vehicle_category_tracks", {})
             if not isinstance(categories, dict):
                 raise ValueError(f"{role}.relevant_vehicle_category_tracks must be an object")
@@ -246,6 +255,10 @@ def recommend(
                     item.get("joining_flow_max_stationary_duration_seconds"),
                     "exit.joining_flow_max_stationary_duration_seconds",
                 )
+                values["joining_flow_last_moving_vehicles"] = _number(item.get("joining_flow_last_moving_vehicles", 0), "exit.joining_flow_last_moving_vehicles", integer=True)
+                values["joining_flow_last_stationary_vehicles"] = _number(item.get("joining_flow_last_stationary_vehicles", 0), "exit.joining_flow_last_stationary_vehicles", integer=True)
+                values["joining_flow_last_unclassified_vehicles"] = _number(item.get("joining_flow_last_unclassified_vehicles", 0), "exit.joining_flow_last_unclassified_vehicles", integer=True)
+                values["joining_flow_last_vehicles"] = _number(item.get("joining_flow_last_vehicles", 0), "exit.joining_flow_last_vehicles", integer=True)
                 if values["joining_flow_frames"] < 2 or values["joining_flow_occupied_frames"] > values["joining_flow_frames"]:
                     raise ValueError("exit joining-road flow frame measurements are inconsistent")
                 classified = values["joining_flow_moving_samples"] + values["joining_flow_stationary_samples"] + values["joining_flow_unclassified_samples"]
@@ -277,25 +290,33 @@ def recommend(
     joining_stationary_samples = int(joining["joining_flow_stationary_samples"])
     joining_unclassified_samples = int(joining["joining_flow_unclassified_samples"])
     joining_known_samples = joining_moving_samples + joining_stationary_samples
-    if joining_vehicle_samples and (joining_known_samples < 3 or joining_unclassified_samples / joining_vehicle_samples > 0.5):
-        return _empty("insufficient", "The joining-road camera sees vehicles but cannot yet classify their movement reliably; wait for more tracked frames before showing green.", camera_count=3, warnings=["joining-road movement classification is not yet reliable"])
+    if joining["joining_flow_last_vehicles"] and joining["joining_flow_last_unclassified_vehicles"] > joining["joining_flow_last_moving_vehicles"] + joining["joining_flow_last_stationary_vehicles"]:
+        return _empty("insufficient", "The joining-road camera sees current vehicles but cannot classify whether they are moving; wait for clearer tracking before showing green.", camera_count=3, warnings=["current joining-road movement classification is not reliable"])
     joining_stationary_ratio = joining_stationary_samples / joining_known_samples if joining_known_samples else 0.0
     joining_max_stopped = int(joining["joining_flow_max_stationary_vehicles"])
     joining_max_moving = int(joining["joining_flow_max_moving_vehicles"])
     joining_max_stopped_seconds = float(joining["joining_flow_max_stationary_duration_seconds"])
-    joining_flow_alert = joining_vehicle_samples > 0 and joining_stationary_ratio >= 0.65
-    joining_flow_clear = joining_vehicle_samples == 0
+    joining_now_moving = int(joining["joining_flow_last_moving_vehicles"])
+    joining_now_stationary = int(joining["joining_flow_last_stationary_vehicles"])
+    joining_now_count = int(joining["joining_flow_last_vehicles"])
+    joining_flow_clear = joining_now_count == 0
+    joining_flow_alert = joining_now_stationary > 0 and joining_now_moving == 0
+    approach_now_queue = int(approach_values["queue_vehicles_now"])
+    approach_now_length = float(approach_values["queue_length_ratio_now"])
+    approach_pressure = approach_now_queue >= rules.queue_medium or approach_now_length >= rules.queue_length_medium_ratio
 
     short_observation_roles = [role for role, values in normalized.items() if float(values["total_observation_seconds"]) < rules.minimum_observation_seconds]
     if short_observation_roles and not conflict_samples:
         return _empty("insufficient", f"Collecting the first {rules.minimum_observation_seconds:g} seconds of camera evidence before assessing traffic pressure.", camera_count=3, warnings=[f"too little observation time: {', '.join(short_observation_roles)}"])
 
-    queue_count_points = min(30.0, p95_queue / max(rules.queue_high, 1) * 30)
-    queue_length_points = min(10.0, p95_queue_length_ratio / max(rules.queue_length_high_ratio, 0.01) * 10)
+    queue_count_points = min(30.0, approach_now_queue / max(rules.queue_high, 1) * 30)
+    queue_length_points = min(10.0, approach_now_length / max(rules.queue_length_high_ratio, 0.01) * 10)
     queue_points = round(queue_count_points + queue_length_points, 1)
-    delay_points = round(min(25.0, max_delay / max(rules.stopped_delay_high_vehicle_seconds, 1) * 25), 1)
-    blockage_points = round(min(20.0, max_blockage / max(rules.blockage_high_seconds, 1) * 20), 1)
-    conflict_points = 25 if pedestrian_vehicle_overlap_now or pedestrian_route_now else 0
+    # Delay and blockage fields are accumulated over the whole clip, so they
+    # are useful report context but cannot be presented as current risk points.
+    delay_points = 0.0
+    blockage_points = 0.0
+    conflict_points = 25 if pedestrian_vehicle_overlap_now else 0
     current_score = min(100, round(queue_points + delay_points + blockage_points + conflict_points))
 
     # Historical reports remain visible as context, but the light uses only
@@ -308,53 +329,32 @@ def recommend(
     history_points = 0
     combined_score = current_score
 
-    conflict = pedestrian_vehicle_overlap_now or pedestrian_route_now
-    high_rule = (
-        p95_queue >= rules.queue_high
-        or p95_queue_length_ratio >= rules.queue_length_high_ratio
-        or max_blockage >= rules.blockage_high_seconds
-        or max_delay >= rules.stopped_delay_high_vehicle_seconds
-        or current_score >= rules.score_high
-    )
-    medium_rule = (
-        p95_queue >= rules.queue_medium
-        or p95_queue_length_ratio >= rules.queue_length_medium_ratio
-        or max_blockage >= rules.blockage_medium_seconds
-        or max_delay >= rules.stopped_delay_medium_vehicle_seconds
-        or current_score >= rules.score_medium
-    )
-    # A stationary queue may simply be waiting at its own red signal. It only
-    # contributes yellow/context; moving flow plus an occupied free-left route
-    # is the competing-traffic red condition.
-    competing_flow_high = p95_queue >= rules.queue_medium and joining_max_moving >= rules.queue_medium
-    joining_high = competing_flow_high
-    joining_medium = (
-        joining_max_moving >= rules.queue_medium
-        or (joining_stationary_ratio >= rules.joining_flow_stationary_ratio_medium and joining_max_stopped >= 1)
-    )
-    if conflict or high_rule or joining_high:
+    conflict = pedestrian_vehicle_overlap_now
+    # Make the junction decision from simultaneous current-frame evidence.
+    # Historical maxima and people elsewhere in camera 1 cannot hold the turn.
+    joining_high = joining_now_moving >= rules.queue_medium
+    high_rule = approach_pressure and joining_high
+    joining_medium = approach_pressure and joining_now_count > 0
+    medium_rule = joining_medium
+    if conflict or high_rule:
         severity = "high"
-        action = "urgent_operator_review_pedestrian_vehicle_conflict" if conflict else "prioritize_joining_road_blockage_review" if joining_high else "prioritize_high_queue_or_blockage_review"
-        rule_name = "pedestrian_vehicle_conflict" if conflict else "high_joining_road_blockage" if joining_high else "high_current_traffic_pressure"
+        action = "urgent_operator_review_pedestrian_vehicle_conflict" if conflict else "prioritize_joining_road_blockage_review" if joining_high else "hold_for_turn_path_clearance"
+        rule_name = "pedestrian_vehicle_conflict" if conflict else "high_joining_road_blockage" if joining_high else "blocked_turn_path"
         reason = (
             "The camera 2 turn-path view is occupied; hold the turn until it is clear for the configured clearance interval."
             if any(item.get("turn_path_blocked_now") for item in camera_metrics if isinstance(item, dict) and item.get("camera_id") == "turning")
-            else "A person is in camera 1's calibrated free-left path; hold the turn until the path clears."
-            if pedestrian_route_now else "Current or recent pedestrian conflict evidence requires holding the turn."
+            else "Current pedestrian conflict evidence requires holding the turn."
             if pedestrian_vehicle_overlap_now else "Both the free-left path and the joining road have high traffic moving toward the merge."
-            if joining_high else "The camera 1 free-left flow has high occupancy, stopped delay, or a sustained blockage."
+            if joining_high else "The camera 2 turn path is obstructed; wait for it to clear."
         )
     elif medium_rule or joining_medium:
         severity = "medium"
         action = "prioritize_joining_road_flow_review" if joining_medium else "prioritize_queue_and_delay_review"
         rule_name = "slow_or_stationary_joining_road_flow" if joining_medium else "medium_current_traffic_pressure"
-        reason = (
-            "The joining-road camera sees competing traffic or a stationary queue. Wait for the flow to clear; stationary vehicles alone do not trigger red."
-            if joining_medium else "The camera 1 free-left path has medium occupancy, delay, or blockage; wait for it to clear."
-        )
+        reason = "Camera 1 has a busy free-left approach while camera 3 currently has traffic using the merge. Wait for that competing flow to ease."
     else:
         severity, action, rule_name = "low", "continue_monitoring", "below_current_pressure_thresholds"
-        reason = "Current camera measurements remain below configured medium thresholds."
+        reason = "Camera 2's turn path is clear and camera 3 has no competing flow, so camera 1 traffic alone does not prevent the free-left turn."
 
     historical_watch = False
 
@@ -364,11 +364,11 @@ def recommend(
     confidence = "moderate" if minimum_camera_frames >= rules.minimum_confidence_frames_per_camera and min_observation >= rules.minimum_observation_seconds else "low"
     light_color = "red" if severity == "high" else "yellow" if severity == "medium" or confidence == "low" else "green"
     light_label = {
-        "red": "RED · TURN PATH OCCUPIED" if conflict else "RED · FREE-LEFT AND JOINING FLOW HIGH" if joining_high else "RED · FREE-LEFT BLOCKAGE OR HIGH QUEUE",
-        "yellow": "YELLOW · JOINING ROAD WAITING OR BUSY" if joining_medium else "YELLOW · HISTORICAL WATCH" if historical_watch else "YELLOW · FREE-LEFT FLOW CAUTION",
+        "red": "RED · TURN PATH OCCUPIED" if conflict else "RED · FREE-LEFT AND JOINING FLOW HIGH",
+        "yellow": "YELLOW · JOINING ROAD ACTIVE" if joining_medium else "YELLOW · FREE-LEFT FLOW CAUTION",
         "green": "GREEN · FREE-LEFT AVAILABLE",
     }[light_color]
-    evidence_quality = f"At least {rules.minimum_observation_seconds:g}s and {rules.minimum_confidence_frames_per_camera} processed frames per view; camera 1's main-lane and free-left polygons must be calibrated, and cameras 2–3 must be aimed at their paths." if confidence == "moderate" else "Limited evidence. Continue observing; green is withheld until all three views provide enough tracked frames."
+    evidence_quality = f"At least {rules.minimum_observation_seconds:g}s and {rules.minimum_confidence_frames_per_camera} processed frames per view; camera 1's main-lane and free-left polygons must be calibrated. Camera 2 checks {'the configured turn-path polygon' if turning_view.get('turn_path_zone_configured') is True else 'its full frame'}; camera 3 uses its full frame." if confidence == "moderate" else "Limited evidence. Continue observing; green is withheld until all three views provide enough tracked frames."
     return {
         "severity": severity,
         "recommended_action": action,
@@ -390,6 +390,8 @@ def recommend(
             "camera_1_free_left_confirmed_tracks": int(approach_values["vehicle_track_count"]),
             "camera_1_main_lane_confirmed_tracks": int(approach_values["approach_lane_vehicle_track_count"]),
             "camera_1_free_left_current_max_occupancy": int(approach_values["maximum_queue_vehicles"]),
+            "camera_1_free_left_queue_vehicles_now": approach_now_queue,
+            "camera_1_free_left_queue_length_ratio_now": round(approach_now_length, 3),
             "camera_1_free_left_queue_length_ratio_p95": round(p95_queue_length_ratio, 3),
             "maximum_camera_blocked_seconds": round(max_blockage, 2),
             "maximum_camera_stopped_delay_vehicle_seconds": round(max_delay, 2),
@@ -398,13 +400,17 @@ def recommend(
             "pedestrian_in_free_left_route_now": pedestrian_route_now,
             "pedestrians_in_free_left_route_now": pedestrian_route_count_now,
             "pedestrian_vehicle_overlap_now": pedestrian_vehicle_overlap_now,
+            "camera_2_pedestrian_scope": "turn_path_polygon" if turning_view.get("turn_path_zone_configured") is True else "full_frame",
             "pedestrian_clearance_hold_seconds": rules.pedestrian_clearance_hold_seconds,
             "joining_road_flow": {
-                "status": "clear" if joining_flow_clear else "stationary_or_slow" if joining_flow_alert else "moving" if joining_known_samples else "uncertain",
+                "status": "clear" if joining_flow_clear else "stationary_or_slow" if joining_flow_alert else "moving" if joining_now_moving else "uncertain",
                 "moving_vehicle_observations": joining_moving_samples,
                 "stationary_vehicle_observations": joining_stationary_samples,
                 "stationary_observation_ratio": round(joining_stationary_ratio, 3),
                 "maximum_moving_vehicles_in_frame": joining_max_moving,
+                "moving_vehicles_now": joining_now_moving,
+                "stationary_vehicles_now": joining_now_stationary,
+                "vehicles_now": joining_now_count,
                 "maximum_stationary_vehicles": joining_max_stopped,
                 "longest_stationary_duration_seconds": round(joining_max_stopped_seconds, 2),
                 "unclassified_observations": joining_unclassified_samples,

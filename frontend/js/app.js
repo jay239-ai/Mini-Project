@@ -10,9 +10,16 @@
   const defaultSiteLabel = 'Junction A · North';
   const fileUrl = { videoPreview: null, pedestrianPreview: null, oppositePreview: null };
   const trackingFrameUrls = { approach: null, turning: null, exit: null };
+  let turnPathReference = [1280, 720];
+  let savedTurnPath = [];
+  let draftTurnPath = [];
+  let drawingTurnPath = false;
   let activeLiveJobId = null;
   let activeAnalysisJobId = null;
   let activeUploadRequest = null;
+  let latestAutomaticDecision = {};
+  let manualSignalOverride = null;
+  let manualSignalStatusMessage = 'Automatic recommendation is active.';
   let stopRequested = false;
   let controlsLocked = false;
   let toastTimer;
@@ -35,7 +42,7 @@
 
   function setControlsLocked(locked) {
     controlsLocked = locked;
-    [...inputs, 'reportUpload', 'sourceMode', 'performanceProfile', 'siteLabelInput', 'liveDeviceApproach', 'liveDeviceTurning', 'liveDeviceExit', 'liveUrlApproach', 'liveUrlTurning', 'liveUrlExit'].forEach((id) => {
+    [...inputs, 'reportUpload', 'sourceMode', 'performanceProfile', 'siteLabelInput', 'liveDeviceApproach', 'liveDeviceTurning', 'liveDeviceExit', 'liveUrlApproach', 'liveUrlTurning', 'liveUrlExit', 'drawTurnPathButton', 'undoTurnPathPoint', 'saveTurnPathButton', 'clearTurnPathButton'].forEach((id) => {
       const element = document.getElementById(id);
       if (element) element.disabled = locked;
     });
@@ -73,6 +80,117 @@
       throw error;
     } finally {
       window.clearTimeout(timeout);
+    }
+  }
+
+  function pathVideoGeometry() {
+    const video = $('#pedestrianPreview');
+    const canvas = $('#turnPathCanvas');
+    if (!video.videoWidth || !video.videoHeight || !canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    const scale = Math.min(rect.width / video.videoWidth, rect.height / video.videoHeight);
+    return { video, canvas, rect, scale, offsetX: (rect.width - video.videoWidth * scale) / 2, offsetY: (rect.height - video.videoHeight * scale) / 2 };
+  }
+
+  function drawTurnPathOverlay() {
+    const video = $('#pedestrianPreview');
+    const canvas = $('#turnPathCanvas');
+    if (!canvas || !video) return;
+    if (!video.videoWidth || video.hidden || $('#sourceMode').value !== 'recorded') {
+      canvas.hidden = !drawingTurnPath;
+      return;
+    }
+    canvas.hidden = !drawingTurnPath && savedTurnPath.length < 3 && draftTurnPath.length < 1;
+    const rect = canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(rect.width * dpr);
+    canvas.height = Math.round(rect.height * dpr);
+    const context = canvas.getContext('2d');
+    context.setTransform(dpr, 0, 0, dpr, 0, 0);
+    context.clearRect(0, 0, rect.width, rect.height);
+    const geometry = pathVideoGeometry();
+    if (!geometry) return;
+    const points = draftTurnPath.length ? draftTurnPath : savedTurnPath;
+    if (!points.length) return;
+    const displayPoints = points.map(([x, y]) => [
+      geometry.offsetX + x * geometry.video.videoWidth / turnPathReference[0] * geometry.scale,
+      geometry.offsetY + y * geometry.video.videoHeight / turnPathReference[1] * geometry.scale,
+    ]);
+    context.lineWidth = 3;
+    context.strokeStyle = '#ff4fb8';
+    context.fillStyle = 'rgba(255, 79, 184, 0.16)';
+    context.beginPath();
+    displayPoints.forEach(([x, y], index) => index ? context.lineTo(x, y) : context.moveTo(x, y));
+    if (!drawingTurnPath && displayPoints.length >= 3) {
+      context.closePath();
+      context.fill();
+    }
+    context.stroke();
+    displayPoints.forEach(([x, y], index) => {
+      context.beginPath();
+      context.arc(x, y, 5, 0, Math.PI * 2);
+      context.fillStyle = '#fff';
+      context.fill();
+      context.fillStyle = '#ff4fb8';
+      context.font = 'bold 12px sans-serif';
+      context.fillText(String(index + 1), x + 8, y - 8);
+    });
+  }
+
+  async function loadTurnPath() {
+    try {
+      const data = await apiJson('/api/v1/analysis/config/turn-path');
+      turnPathReference = data.reference_resolution || [1280, 720];
+      savedTurnPath = Array.isArray(data.polygon) ? data.polygon : [];
+      $('#turnPathCalibrationStatus').textContent = data.configured
+        ? 'Saved boundary loaded. Draw again to adjust it.'
+        : 'No boundary saved. Camera 2 will analyze its full frame; draw a path only if you want to exclude the footpath.';
+      $('#clearTurnPathButton').disabled = !data.configured;
+      drawTurnPathOverlay();
+    } catch (error) {
+      $('#turnPathCalibrationStatus').textContent = `Path settings could not be loaded: ${error.message}`;
+    }
+  }
+
+  function startTurnPathDrawing() {
+    const video = $('#pedestrianPreview');
+    if (!video.videoWidth) {
+      notify('Choose the camera 2 clip first so the path can be marked on its frame.');
+      return;
+    }
+    draftTurnPath = [];
+    video.pause();
+    drawingTurnPath = true;
+    $('#turnPathCanvas').hidden = false;
+    $('#turnPathCanvas').style.pointerEvents = 'auto';
+    $('#turnPathCalibrationStatus').textContent = 'Click around the road vehicles can enter. Keep the footpath outside. Add at least three points.';
+    $('#undoTurnPathPoint').disabled = true;
+    $('#saveTurnPathButton').disabled = true;
+    drawTurnPathOverlay();
+  }
+
+  async function persistTurnPath(polygon) {
+    $('#saveTurnPathButton').disabled = true;
+    $('#clearTurnPathButton').disabled = true;
+    try {
+      const data = await apiJson('/api/v1/analysis/config/turn-path', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ polygon }),
+      });
+      savedTurnPath = data.polygon;
+      draftTurnPath = [];
+      drawingTurnPath = false;
+      $('#turnPathCanvas').style.pointerEvents = 'none';
+      $('#turnPathCalibrationStatus').textContent = data.message;
+      $('#clearTurnPathButton').disabled = !data.configured;
+      drawTurnPathOverlay();
+      notify(data.configured ? 'Camera 2 path saved.' : 'Camera 2 path cleared.');
+    } catch (error) {
+      $('#turnPathCalibrationStatus').textContent = error.message;
+      $('#clearTurnPathButton').disabled = !savedTurnPath.length;
+      $('#saveTurnPathButton').disabled = draftTurnPath.length < 3;
     }
   }
 
@@ -201,6 +319,14 @@
       document.getElementById(cameraViews[cameraIndex].status).textContent = 'Waiting';
       document.getElementById(cameraViews[cameraIndex].observations).textContent = 'Vehicle and pedestrian counts appear while frames are analyzed.';
       if (cameraIndex === 2) $('#joiningFlowStatus').textContent = 'Joining-road movement: waiting for camera data.';
+      if (cameraIndex === 1) {
+        drawingTurnPath = false;
+        draftTurnPath = [];
+        $('#turnPathCanvas').hidden = true;
+        $('#turnPathCanvas').style.pointerEvents = 'none';
+        $('#saveTurnPathButton').disabled = true;
+        $('#undoTurnPathPoint').disabled = true;
+      }
       updateUploadState();
       return;
     }
@@ -328,18 +454,40 @@
     }));
   }
 
-  function renderDecision(decision = {}) {
+  function renderCurrentSignal() {
+    if (manualSignalOverride && Date.now() >= manualSignalOverride.endsAt) {
+      manualSignalOverride = null;
+      manualSignalStatusMessage = 'Override timer expired. Automatic recommendation resumed.';
+    }
+    const decision = latestAutomaticDecision || {};
     const severity = String(decision.severity || 'insufficient').toLowerCase();
     const fallbackColor = severity === 'high' ? 'red' : severity === 'low' && decision.confidence === 'moderate' ? 'green' : 'yellow';
-    const color = decision.traffic_light?.color || fallbackColor;
-    const label = decision.traffic_light?.label || (color === 'green' ? 'GREEN · FLOWING' : color === 'red' ? 'RED · HIGH PRESSURE' : severity === 'insufficient' ? 'YELLOW · INSUFFICIENT DATA' : 'YELLOW · CAUTION');
+    const automaticColor = decision.traffic_light?.color || fallbackColor;
+    const color = manualSignalOverride?.color || automaticColor;
+    const label = manualSignalOverride
+      ? `MANUAL · ${color.toUpperCase()}`
+      : decision.traffic_light?.label || (color === 'green' ? 'GREEN · FLOWING' : color === 'red' ? 'RED · HIGH PRESSURE' : severity === 'insufficient' ? 'YELLOW · INSUFFICIENT DATA' : 'YELLOW · CAUTION');
     const lamp = $('#trafficLamp');
     lamp.dataset.state = color;
     lamp.setAttribute('aria-label', `Traffic condition advisory: ${label}`);
     $('#trafficStateLabel').textContent = label;
-    $('#decisionReason').textContent = decision.reason || 'Waiting for current camera evidence.';
-    const evidence = decision.traffic_light?.evidence_quality || (decision.confidence === 'moderate' ? 'Evidence quality: sufficient observation across the required camera views.' : 'Evidence quality: limited. Yellow means wait for more reliable camera evidence.');
-    $('#decisionEvidence').textContent = `${evidence} Advisory only; this does not control a real traffic signal.`;
+    if (manualSignalOverride) {
+      const remaining = Math.max(0, Math.ceil((manualSignalOverride.endsAt - Date.now()) / 1000));
+      $('#decisionReason').textContent = `Manual ${color} display override. Automatic recommendation resumes in ${remaining} second${remaining === 1 ? '' : 's'}.`;
+      $('#decisionEvidence').textContent = 'Manual override applies to this dashboard display only; no physical signal hardware is controlled.';
+      $('#manualSignalStatus').textContent = `Manual ${color} active · ${remaining} second${remaining === 1 ? '' : 's'} remaining.`;
+    } else {
+      $('#decisionReason').textContent = decision.reason || 'Waiting for current camera evidence.';
+      const evidence = decision.traffic_light?.evidence_quality || (decision.confidence === 'moderate' ? 'Evidence quality: sufficient observation across the required camera views.' : 'Evidence quality: limited. Yellow means wait for more reliable camera evidence.');
+      $('#decisionEvidence').textContent = `${evidence} Advisory only; this does not control a real traffic signal.`;
+      $('#manualSignalStatus').textContent = manualSignalStatusMessage;
+    }
+    $('#returnAutomaticSignal').disabled = !manualSignalOverride;
+  }
+
+  function renderDecision(decision = {}) {
+    latestAutomaticDecision = decision;
+    renderCurrentSignal();
   }
 
   function renderAnalysis(jobId, result = {}) {
@@ -562,6 +710,12 @@
     document.body.dataset.sourceMode = live ? 'live' : 'upload';
     $('#recordedSourceControls').hidden = live;
     $('#liveSourceControls').hidden = !live;
+    $('#turnPathCalibration').hidden = live;
+    if (live) {
+      drawingTurnPath = false;
+      $('#turnPathCanvas').hidden = true;
+      $('#turnPathCanvas').style.pointerEvents = 'none';
+    }
     $('#analyzeBtn').hidden = live;
     resetTrackingViews();
     cameraViews.forEach((camera) => {
@@ -573,10 +727,61 @@
     $('#sourceStatus').textContent = live ? 'LIVE CAMERA MODE' : 'UPLOAD MODE';
     renderDecision({ severity: 'insufficient', confidence: 'low', reason: live ? 'Waiting for all three live views to provide enough camera evidence.' : 'Choose three clips and analyze them to determine the traffic condition.' });
     updateUploadState();
+    drawTurnPathOverlay();
   }
   $('#sourceMode').addEventListener('change', applySourceMode);
   applySourceMode();
+  $('#applyManualSignal').addEventListener('click', () => {
+    const durationSeconds = Number($('#manualSignalSeconds').value);
+    const color = $('#manualSignalColor').value;
+    if (!Number.isInteger(durationSeconds) || durationSeconds < 1 || durationSeconds > 3600) {
+      manualSignalStatusMessage = 'Enter a whole number from 1 to 3600 seconds.';
+      $('#manualSignalStatus').textContent = manualSignalStatusMessage;
+      $('#manualSignalSeconds').focus();
+      return;
+    }
+    manualSignalOverride = { color, endsAt: Date.now() + durationSeconds * 1000 };
+    manualSignalStatusMessage = 'Automatic recommendation is active.';
+    renderCurrentSignal();
+  });
+  $('#returnAutomaticSignal').addEventListener('click', () => {
+    manualSignalOverride = null;
+    manualSignalStatusMessage = 'Manual override cleared. Automatic recommendation resumed.';
+    renderCurrentSignal();
+  });
+  window.setInterval(renderCurrentSignal, 250);
   inputs.forEach((id, index) => document.getElementById(id).addEventListener('change', (event) => showLocalVideo(event.target.files[0] || null, index)));
+  $('#pedestrianPreview').addEventListener('loadedmetadata', drawTurnPathOverlay);
+  $('#pedestrianPreview').addEventListener('seeked', drawTurnPathOverlay);
+  $('#drawTurnPathButton').addEventListener('click', startTurnPathDrawing);
+  $('#undoTurnPathPoint').addEventListener('click', () => {
+    draftTurnPath.pop();
+    $('#undoTurnPathPoint').disabled = draftTurnPath.length === 0;
+    $('#saveTurnPathButton').disabled = draftTurnPath.length < 3;
+    drawTurnPathOverlay();
+  });
+  $('#saveTurnPathButton').addEventListener('click', () => persistTurnPath(draftTurnPath));
+  $('#clearTurnPathButton').addEventListener('click', () => persistTurnPath([]));
+  $('#turnPathCanvas').addEventListener('pointerdown', (event) => {
+    if (!drawingTurnPath) return;
+    const geometry = pathVideoGeometry();
+    if (!geometry) return;
+    const localX = event.clientX - geometry.rect.left - geometry.offsetX;
+    const localY = event.clientY - geometry.rect.top - geometry.offsetY;
+    const sourceX = localX / geometry.scale;
+    const sourceY = localY / geometry.scale;
+    if (sourceX < 0 || sourceY < 0 || sourceX > geometry.video.videoWidth || sourceY > geometry.video.videoHeight) return;
+    draftTurnPath.push([
+      Math.round(sourceX / geometry.video.videoWidth * turnPathReference[0]),
+      Math.round(sourceY / geometry.video.videoHeight * turnPathReference[1]),
+    ]);
+    $('#undoTurnPathPoint').disabled = false;
+    $('#saveTurnPathButton').disabled = draftTurnPath.length < 3;
+    $('#turnPathCalibrationStatus').textContent = `${draftTurnPath.length} point${draftTurnPath.length === 1 ? '' : 's'} marked. Click Save path when the boundary follows the turn lane.`;
+    drawTurnPathOverlay();
+  });
+  window.addEventListener('resize', drawTurnPathOverlay);
+  loadTurnPath();
   $('#reportUpload').addEventListener('change', (event) => importReport(event.target.files[0]));
   $('#downloadReportButton').addEventListener('click', async (event) => {
     const button = event.currentTarget;

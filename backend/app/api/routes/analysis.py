@@ -144,10 +144,6 @@ def _validate_zone_config(config: dict[str, Any]) -> None:
         rows = cameras.get(camera_id)
         if not isinstance(rows, list) or not valid_zone_configuration(camera_id, rows):
             raise ValueError(f"Camera zone configuration for {camera_id} is missing required zones.")
-        # Camera 2 and 3 are intentionally full-frame views. Ignore any legacy
-        # polygons in those entries; only camera 1's free-left ROI is consumed.
-        if camera_id != "approach":
-            continue
         names: set[str] = set()
         for row in rows:
             if not isinstance(row, dict):
@@ -156,6 +152,13 @@ def _validate_zone_config(config: dict[str, Any]) -> None:
             if not isinstance(name, str) or not name.strip() or name in names:
                 raise ValueError(f"Camera zone names for {camera_id} must be non-empty and unique.")
             names.add(name)
+            allowed_kinds = {
+                "approach": {"approach", "free_left"},
+                "turning": {"turn_path"},
+                "exit": {"exit"},
+            }[camera_id]
+            if row.get("kind") not in allowed_kinds:
+                raise ValueError(f"Camera zone '{name}' has an unsupported kind for {camera_id}.")
             if not isinstance(polygon, list) or len(polygon) < 3:
                 raise ValueError(f"Camera zone '{name}' needs at least three points.")
             points: list[tuple[int, int]] = []
@@ -184,10 +187,12 @@ def _validate_zone_config(config: dict[str, Any]) -> None:
 
 
 def _zones_for_analysis(camera_id: str, zone_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Use the approach-lane and free-left ROIs only on camera 1."""
+    """Select calibrated analysis polygons for each camera role."""
 
     if camera_id == "approach":
         return [zone for zone in zone_rows if zone.get("kind") in {"approach", "free_left"}]
+    if camera_id == "turning":
+        return [zone for zone in zone_rows if zone.get("kind") == "turn_path"]
     return []
 
 
@@ -277,6 +282,54 @@ def analysis_capabilities() -> dict[str, Any]:
         "live_camera_ready": not missing,
         "input_modes": ["uploaded_video", "local_usb_camera", "rtsp_camera", "http_camera"],
         "note": "Live sources can use locally attached USB webcams or RTSP/RTSPS/HTTP/HTTPS streams readable by OpenCV.",
+    }
+
+
+@router.get("/config/turn-path", tags=["camera calibration"])
+def get_turn_path_calibration() -> dict[str, Any]:
+    """Return the locally configured camera 2 path polygon for the dashboard editor."""
+
+    try:
+        config = json.loads(ZONE_CONFIG.read_text(encoding="utf-8"))
+        rows = config["cameras"]["turning"]
+        polygon = next((row.get("polygon", []) for row in rows if row.get("kind") == "turn_path"), [])
+        return {
+            "reference_resolution": config["reference_resolution"],
+            "polygon": polygon,
+            "configured": len(polygon) >= 3,
+        }
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        LOGGER.exception("Could not read camera 2 turn-path calibration")
+        raise HTTPException(status_code=500, detail="Could not read the local camera zone configuration.") from error
+
+
+@router.put("/config/turn-path", tags=["camera calibration"])
+def save_turn_path_calibration(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate and persist camera 2's polygon in reference-frame pixels."""
+
+    polygon = payload.get("polygon")
+    if not isinstance(polygon, list) or (polygon and len(polygon) < 3):
+        raise HTTPException(status_code=422, detail="Draw at least three points, or clear the polygon completely.")
+    try:
+        config = json.loads(ZONE_CONFIG.read_text(encoding="utf-8"))
+        config["cameras"]["turning"] = [] if not polygon else [{
+            "name": "free_left_turn_path",
+            "kind": "turn_path",
+            "polygon": polygon,
+        }]
+        _validate_zone_config(config)
+        temporary_path = ZONE_CONFIG.with_suffix(".tmp")
+        temporary_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary_path.replace(ZONE_CONFIG)
+    except HTTPException:
+        raise
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return {
+        "configured": bool(polygon),
+        "polygon": polygon,
+        "reference_resolution": config["reference_resolution"],
+        "message": "Camera 2 turn path saved." if polygon else "Camera 2 turn path cleared; the signal recommendation will remain cautious until calibrated.",
     }
 
 

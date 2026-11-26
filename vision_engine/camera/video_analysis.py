@@ -247,7 +247,9 @@ def analyze_video(
                     ) if camera_id == "approach" else 0,
                     "pedestrians_in_frame": visible_pedestrians,
                     "turn_path_objects_in_frame": analyzer.metrics.turn_path_object_count_now,
+                    "pedestrians_in_turn_path": analyzer.metrics.turn_path_pedestrian_count_now,
                     "turn_path_stationary_vehicle_count": analyzer.metrics.turn_path_stationary_vehicle_count_now,
+                    "turn_path_zone_configured": analyzer.metrics.turn_path_zone_configured,
                     "pedestrians_in_free_left_route": analyzer.metrics.pedestrian_in_free_left_route_count_now,
                     "vehicle_tracks": analyzer.metrics.relevant_vehicle_track_count if camera_id in {"approach", "exit"} else sum(analyzer.metrics.category_counts.values()),
                     "approach_lane_vehicle_tracks": analyzer.metrics.approach_lane_vehicle_track_count,
@@ -334,12 +336,12 @@ def _draw_overlay(cv2: Any, frame: Any, zones: list[Zone], detections: list[Any]
 
     import numpy as np
 
-    colors = {"free_left": (0, 0, 255), "approach": (0, 220, 255), "pedestrian_conflict": (255, 0, 255), "exit": (255, 160, 0)}
+    colors = {"free_left": (0, 0, 255), "approach": (0, 220, 255), "pedestrian_conflict": (255, 0, 255), "turn_path": (255, 0, 255), "exit": (255, 160, 0)}
     for zone in zones:
         points = np.array(zone.polygon, dtype=np.int32).reshape((-1, 1, 2))
         color = colors.get(zone.kind, (120, 230, 120))
         cv2.polylines(frame, [points], isClosed=True, color=color, thickness=2)
-        display_name = {"queue_area": "QUEUE AREA", "free_left_lane": "FREE LEFT", "joining_road_flow": "JOINING ROAD FLOW"}.get(zone.name, zone.name)
+        display_name = {"queue_area": "QUEUE AREA", "free_left_lane": "FREE LEFT", "joining_road_flow": "JOINING ROAD FLOW", "free_left_turn_path": "FREE-LEFT VEHICLE PATH"}.get(zone.name, zone.name)
         if zone.kind == "free_left":
             label_x = max(min(point[0] for point in zone.polygon), max(point[0] for point in zone.polygon) - 160)
             label_y = max(point[1] for point in zone.polygon) - 12
